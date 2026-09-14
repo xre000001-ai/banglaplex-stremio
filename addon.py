@@ -50,7 +50,7 @@ from urllib.parse import quote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.1.0"
+VERSION    = "1.1.1"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -177,6 +177,7 @@ _SWR_LOCK = threading.Lock()
 
 _IO_EX   = ThreadPoolExecutor(max_workers=12, thread_name_prefix="io")
 _V_EX    = ThreadPoolExecutor(max_workers=6, thread_name_prefix="verify")
+_P_EX    = ThreadPoolExecutor(max_workers=10, thread_name_prefix="proxy")
 _BUILD_EX = ThreadPoolExecutor(max_workers=2, thread_name_prefix="build")
 
 _S = requests.Session()
@@ -442,12 +443,12 @@ def n1_decrypt(hexstr):
 POOL_SRC = os.environ.get(
     "BPX_PROXY_SOURCE",
     "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies"
-    "&proxy_format=protocolipport&format=text")
+    "&proxy_type=http&proxy_format=protocolipport&format=text")
 POOL_ON   = os.environ.get("BPX_PROXY", "auto") != "0"
 POOL_TTL  = 360.0          # refresh the list every 6 min
 POOL_MAX  = 40
-POOL_TRY  = int(os.environ.get("BPX_PROXY_TRY", "3"))
-POOL_TO   = 9.0            # per-exit connect/read timeout (free proxies are slow)
+POOL_TRY  = int(os.environ.get("BPX_PROXY_TRY", "5"))   # exits raced per fetch
+POOL_TO   = 8.0            # per-exit connect/read timeout (free proxies are slow)
 DIRECT_BLOCK_TTL = 600.0   # host benched for direct egress after a 403/503
 
 _HOST_BLOCK = {}
@@ -488,8 +489,16 @@ def _pool_refresh(force=False):
         r = requests.get(POOL_SRC, timeout=12, headers={"User-Agent": UA})
         for ln in (r.text or "").splitlines():
             ln = ln.strip()
-            if ln and ":" in ln and not ln.startswith("#"):
-                urls.append(ln if "://" in ln else "http://" + ln)
+            if not ln or ln.startswith("#") or ":" not in ln:
+                continue
+            if "://" not in ln:
+                ln = "http://" + ln
+            # socks4/socks5 exits need PySocks; without it requests raises
+            # InvalidSchema, so every such exit looked "dead" (measured on prod:
+            # 40/40 exits were socks4 and the whole pool was unusable)
+            if ln.split("://")[0] not in ("http", "https"):
+                continue
+            urls.append(ln)
     except Exception:
         urls = []
     urls = list(dict.fromkeys(urls))[:POOL_MAX]
@@ -564,25 +573,71 @@ def _fetch(url, timeout=12, referer=None, extra_headers=None, stream=False,
         if not use_pool:
             return r, False
         _DIRECT_BAD[host] = time.time() + DIRECT_BLOCK_TTL
-    for u in _pool_order()[:POOL_TRY]:
+    r = _pool_get(url, hd, min(timeout, POOL_TO), stream)
+    if r is None:
+        return None, True
+    if r.status_code == 429:
+        _bench(host, 20)
+    return r, True
+
+
+def _pool_get(url, hd, timeout, stream=False):
+    """Race POOL_TRY exits at once and keep the first good answer.
+
+    Free proxies are mostly dead or slow: trying them one after another spent
+    8s per corpse and a cold resolve never fit inside the 22s wall. Racing costs
+    the same wall-clock as the fastest healthy exit. Losers are closed."""
+    exits = _pool_order()[:POOL_TRY]
+    if not exits:
+        return None
+
+    def one(u):
         try:
-            r = _S.get(url, headers=hd, timeout=min(timeout, POOL_TO),
-                       stream=stream, proxies={"http": u, "https": u})
+            r = _S.get(url, headers=hd, timeout=timeout, stream=stream,
+                       proxies={"http": u, "https": u})
         except Exception:
             _pool_note(u, False)
-            continue
+            return None
         if r.status_code in (403, 503):
             try:
                 r.close()
             except Exception:
                 pass
             _pool_note(u, False, blocked=True)     # this exit is flagged too
-            continue
+            return None
         _pool_note(u, True)
-        if r.status_code == 429:
-            _bench(host, 20)
-        return r, True
-    return None, True
+        return r
+
+    if len(exits) == 1:
+        return one(exits[0])
+    futs = {_P_EX.submit(one, u): u for u in exits}
+    win = []
+
+    def reap(f):
+        if win and f is not win[0]:
+            try:
+                r = f.result(timeout=0)
+                if r is not None:
+                    r.close()
+            except Exception:
+                pass
+    for f in futs:
+        f.add_done_callback(reap)
+    try:
+        for f in as_completed(futs, timeout=timeout + 3):
+            try:
+                r = f.result(timeout=0)
+            except Exception:
+                r = None
+            if r is not None:
+                win.append(f)
+                return r
+    except Exception:
+        pass                                       # every racer timed out
+    for f in futs:
+        if not f.done():
+            f.cancel()
+    return None
 
 
 def _get(url, timeout=12, referer=None, want_json=False):

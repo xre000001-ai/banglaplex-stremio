@@ -1525,6 +1525,60 @@ def test_net_probe_reports_both_paths():
     assert d["pool"]["pool"] == 3
 
 
+def test_pool_drops_socks_exits():
+    """socks4/5 exits need PySocks; without it every one raised InvalidSchema and
+    the whole pool looked dead (40/40 on the first prod probe)."""
+    txt = ("socks4://57.128.231.218:1004\nsocks5://9.9.9.9:1080\n"
+           "http://1.2.3.4:8080\nhttps://5.6.7.8:8443\n")
+    with mock.patch.object(addon.requests, "get", return_value=_resp(200, txt)):
+        addon._POOL[0] = []
+        addon._POOL_TS[0] = 0.0
+        out = addon._pool_refresh(force=True)
+    assert out == ["http://1.2.3.4:8080", "https://5.6.7.8:8443"], out
+
+
+def test_pool_get_races_exits_and_keeps_first_good():
+    _pool_reset()
+    good = _resp(200, "ok")
+    closed = []
+
+    class Slow:
+        status_code = 200
+
+        def close(self):
+            closed.append("slow")
+
+    def fake(u, **k):
+        p = (k.get("proxies") or {}).get("http")
+        if p == "http://1.1.1.1:8080":
+            time.sleep(0.4)
+            return Slow()                      # a LATE winner must be closed
+        if p == "http://2.2.2.2:8080":
+            return good                        # first good answer wins
+        raise RuntimeError("dead exit")
+    with mock.patch.object(addon._S, "get", side_effect=fake):
+        r = addon._pool_get("https://x/y", {"User-Agent": "t"}, 5)
+    assert r is good
+    for _ in range(40):                        # let the losers finish cleanly
+        if closed:
+            break
+        time.sleep(0.05)
+    assert "slow" in closed, "losing racers must be closed, not leaked"
+    assert addon._POOL_OK.get("http://2.2.2.2:8080"), "the winner becomes sticky"
+
+
+def test_pool_get_benches_dead_exits():
+    _pool_reset()
+    with mock.patch.object(addon._S, "get", side_effect=RuntimeError("dead")):
+        assert addon._pool_get("https://x", {"User-Agent": "t"}, 3) is None
+    assert set(addon._POOL_BAD) == set(addon._POOL[0]), addon._POOL_BAD
+
+
+def test_pool_get_no_exits():
+    addon._POOL[0] = []
+    assert addon._pool_get("https://x", {}, 3) is None
+
+
 # ═════════════════════════════════════════════ 16. zero-bandwidth contract
 def test_zero_bandwidth_no_media_routes():
     """Render must never carry a media byte: no playlist/segment/subtitle relay
