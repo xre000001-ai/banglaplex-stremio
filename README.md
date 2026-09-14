@@ -51,6 +51,23 @@ contains the asked-for season/episode, labelled honestly
 (`◫ S01 E01 ◇ ⚠ full-season file`). An episode-level request never falls back to
 a *different* episode pack — wrong content is worse than an honest empty.
 
+### Egress: direct first, proxy pool only when the host blocks us
+
+Render's Singapore egress is **Cloudflare-flagged on banglaplex.biz**: the JSON
+autocomplete answers `200 []` while `/watch/` and `/search/` come back 403 (the
+same calls work from a normal IP). So every site fetch is adaptive — try direct,
+and the moment a host proves blocked *from here*, bench direct egress for that
+host (10 min) and ride a free proxy pool (proxyscrape, refreshed every 6 min,
+exits scored + sticky for 90 s, bad exits benched 5 min / platform-blocked
+15 min). The fallback happens **inside the same call**, so a user never sees the
+first failure. From an unblocked IP the pool is never touched at all.
+
+`/debug/net?k=…` probes every host both ways (direct vs exit) and reports status,
+bytes, ms and a body snippet — the fastest way to see what an egress can reach.
+
+Segment probes (`_range_probe`) are **never** proxied: playability must be proven
+on a normal client path, and no media byte may ride a free exit.
+
 ### Zero bandwidth
 
 Render carries **no media bytes**. This addon only ever emits small JSON: card
@@ -134,6 +151,9 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 | `BPX_MAX_SUBS` | `6` | subtitle tracks per card (en/hi/bn first) |
 | `BPX_CARDS` | `1` | `0` = kill switch, answers empty |
 | `BPX_INHOUSE` | `0` | `1` = also emit the IP-bound raw-IP path (debug only) |
+| `BPX_PROXY` | `auto` | `0` = never use the free proxy pool |
+| `BPX_PROXY_SOURCE` | proxyscrape | free HTTP proxy list URL |
+| `BPX_PROXY_TRY` | `3` | exits attempted per fetch |
 | `BPX_DEBUG_KEY` | `bpx-dbg-4c9e` | `/debug/*` key — **change this in prod** |
 | `TMDB_API_KEY` | built-in | metadata + alternative titles |
 
@@ -142,7 +162,7 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 ## Tests
 
 ```bash
-python3 test_banglaplex.py           # 113 offline tests, every network call mocked
+python3 test_banglaplex.py           # 123 offline tests, every network call mocked
 BPX_LIVE=1 python3 test_banglaplex.py # + 4 live integration tests (real site/CDN)
 ```
 

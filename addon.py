@@ -50,7 +50,7 @@ from urllib.parse import quote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.0.0"
+VERSION    = "1.1.0"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -433,8 +433,32 @@ def n1_decrypt(hexstr):
 
 
 # ════════════════════════════════════════════════════════════ 4. HTTP HELPERS
+# Render's Singapore egress is Cloudflare-flagged on banglaplex.biz: the JSON
+# autocomplete answers 200-but-empty while /watch/ and /search/ come back 403.
+# Same calls from a normal IP are fine. So every site fetch adapts: try direct,
+# and the moment a host proves blocked from here, ride the free proxy pool
+# (house pattern — MovieBox §19). Nothing media-bearing ever goes through a
+# proxy: cards still point the player straight at the CDN.
+POOL_SRC = os.environ.get(
+    "BPX_PROXY_SOURCE",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies"
+    "&proxy_format=protocolipport&format=text")
+POOL_ON   = os.environ.get("BPX_PROXY", "auto") != "0"
+POOL_TTL  = 360.0          # refresh the list every 6 min
+POOL_MAX  = 40
+POOL_TRY  = int(os.environ.get("BPX_PROXY_TRY", "3"))
+POOL_TO   = 9.0            # per-exit connect/read timeout (free proxies are slow)
+DIRECT_BLOCK_TTL = 600.0   # host benched for direct egress after a 403/503
+
 _HOST_BLOCK = {}
 _HOST_BLOCK_LOCK = threading.Lock()
+_POOL = [[]]               # ["http://ip:port", ...]
+_POOL_TS = [0.0]
+_POOL_LOCK = threading.Lock()
+_POOL_BAD = {}             # exit -> benched-until
+_POOL_OK = {}              # exit -> (successes, last_ok)
+_STICKY = [None, 0.0]      # ride one good exit for 90s (a chain, not a dice roll)
+_DIRECT_BAD = {}           # host -> direct egress benched until
 
 
 def _bench(host, secs):
@@ -448,36 +472,137 @@ def _blocked_left(host=None):
         if host:
             return max(0.0, _HOST_BLOCK.get(host, 0.0) - now)
         vals = [v - now for v in _HOST_BLOCK.values()]
-        return max(vals) if vals else 0.0
+        return max([0.0] + vals)
+
+
+def _pool_refresh(force=False):
+    if not POOL_ON:
+        return []
+    now = time.time()
+    with _POOL_LOCK:
+        if _POOL[0] and not force and now - _POOL_TS[0] < POOL_TTL:
+            return list(_POOL[0])
+        _POOL_TS[0] = now
+    urls = []
+    try:
+        r = requests.get(POOL_SRC, timeout=12, headers={"User-Agent": UA})
+        for ln in (r.text or "").splitlines():
+            ln = ln.strip()
+            if ln and ":" in ln and not ln.startswith("#"):
+                urls.append(ln if "://" in ln else "http://" + ln)
+    except Exception:
+        urls = []
+    urls = list(dict.fromkeys(urls))[:POOL_MAX]
+    with _POOL_LOCK:
+        if urls:
+            _POOL[0] = urls
+        return list(_POOL[0])
+
+
+def _pool_order():
+    """Healthy exits, sticky-first, then most-successful first."""
+    now = time.time()
+    urls = _pool_refresh()
+    good = [u for u in urls if _POOL_BAD.get(u, 0.0) <= now]
+    sticky = _STICKY[0] if _STICKY[1] > now else None
+    good.sort(key=lambda u: (0 if u == sticky else 1,
+                             -(_POOL_OK.get(u) or (0, 0))[0]))
+    return good
+
+
+def _pool_note(u, ok, blocked=False):
+    now = time.time()
+    if ok:
+        n = (_POOL_OK.get(u) or (0, 0))[0]
+        _POOL_OK[u] = (n + 1, now)
+        _POOL_BAD.pop(u, None)
+        _STICKY[0], _STICKY[1] = u, now + 90
+    else:
+        _POOL_BAD[u] = now + (900 if blocked else 300)
+        if _STICKY[0] == u:
+            _STICKY[1] = 0.0
+
+
+def _pool_stats():
+    now = time.time()
+    return {"pool": len(_POOL[0]),
+            "healthy": len([u for u in _POOL[0] if _POOL_BAD.get(u, 0.0) <= now]),
+            "sticky": _STICKY[0] if _STICKY[1] > now else None,
+            "known_good": len(_POOL_OK),
+            "direct_blocked_hosts": [h for h, t in _DIRECT_BAD.items() if t > now],
+            "enabled": POOL_ON}
+
+
+def _fetch(url, timeout=12, referer=None, extra_headers=None, stream=False,
+           allow_proxy=None):
+    """(requests.Response | None, via_proxy). Direct first; on a 403/503/transport
+    failure the host is benched for direct egress and the pool takes over inside
+    the SAME call, so the user never sees the first failure."""
+    host = urlparse(url).netloc
+    hd = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
+    if referer:
+        hd["Referer"] = referer
+    if extra_headers:
+        hd.update(extra_headers)
+    use_pool = POOL_ON and (allow_proxy is not False)
+    if not use_pool or time.time() >= _DIRECT_BAD.get(host, 0.0):
+        if time.time() < (_HOST_BLOCK.get(host) or 0.0):
+            return None, False
+        try:
+            r = _S.get(url, headers=hd, timeout=timeout, stream=stream)
+        except Exception:
+            r = None
+        if r is not None and r.status_code not in (403, 503):
+            if r.status_code in (429,):
+                _bench(host, 20)
+            return r, False
+        if stream and r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
+        if not use_pool:
+            return r, False
+        _DIRECT_BAD[host] = time.time() + DIRECT_BLOCK_TTL
+    for u in _pool_order()[:POOL_TRY]:
+        try:
+            r = _S.get(url, headers=hd, timeout=min(timeout, POOL_TO),
+                       stream=stream, proxies={"http": u, "https": u})
+        except Exception:
+            _pool_note(u, False)
+            continue
+        if r.status_code in (403, 503):
+            try:
+                r.close()
+            except Exception:
+                pass
+            _pool_note(u, False, blocked=True)     # this exit is flagged too
+            continue
+        _pool_note(u, True)
+        if r.status_code == 429:
+            _bench(host, 20)
+        return r, True
+    return None, True
 
 
 def _get(url, timeout=12, referer=None, want_json=False):
-    """Site/player fetch. Returns a requests.Response or None (transient).
-    403/429/503 benches ONLY that host — one grumpy frontend must never take
-    down the site scrape or the metadata race with it."""
-    hd = {"User-Agent": UA}
-    if referer:
-        hd["Referer"] = referer
+    """Site/player fetch -> requests.Response | None (transient)."""
     host = urlparse(url).netloc
     if time.time() < (_HOST_BLOCK.get(host) or 0.0):
         return None
-    try:
-        r = _S.get(url, headers=hd, timeout=timeout)
-    except Exception:
-        return None
-    if r.status_code in (403, 429, 503):
+    r, _via = _fetch(url, timeout=timeout, referer=referer)
+    if r is not None and r.status_code in (403, 429, 503):
         _bench(host, 20 if r.status_code == 429 else 60)
     return r
 
 
 def _playlist_head(url, referer=None, nbytes=8192, timeout=15):
-    """Read ONLY the head of a playlist (the 3n1 variants ignore Range and
-    would otherwise stream 1.4MB into us). stream+read+close, house pattern."""
-    hd = {"User-Agent": UA}
-    if referer:
-        hd["Referer"] = referer
+    """Read ONLY the head of a playlist (the 3n1 variants ignore Range and would
+    otherwise stream 1.4MB into us). stream+read+close, house pattern."""
     try:
-        r = _S.get(url, headers=hd, timeout=timeout, stream=True)
+        r, _via = _fetch(url, timeout=timeout, referer=referer, stream=True)
+        if r is None:
+            return None, ""
         try:
             if r.status_code not in (200, 206):
                 return r.status_code, ""
@@ -494,12 +619,14 @@ def _playlist_head(url, referer=None, nbytes=8192, timeout=15):
 
 
 def _range_probe(url, referer=None, nbytes=1024, timeout=12):
-    """Segment playability probe: expect 206 (or 200 with a body)."""
-    hd = {"User-Agent": UA, "Range": "bytes=0-%d" % (nbytes - 1)}
-    if referer:
-        hd["Referer"] = referer
+    """Segment playability probe: expect 206 (or 200 with a body).
+    Never proxied: this must prove the file plays from a normal client path,
+    and media must not touch a free exit."""
     try:
-        r = _S.get(url, headers=hd, timeout=timeout, stream=True)
+        r, _via = _fetch(url, timeout=timeout, referer=referer, stream=True,
+                         allow_proxy=False)
+        if r is None:
+            return None, 0
         try:
             code = r.status_code
             body = next(r.iter_content(256), b"") if code in (200, 206) else b""
@@ -1758,6 +1885,7 @@ class Handler(BaseHTTPRequestHandler):
                 "site": SITE, "n1_hosts": list(N1_HOSTS),
                 "stats": dict(_STATS),
                 "blocked_hosts_s": int(_blocked_left()),
+                "proxy": _pool_stats(),
                 "caches": [c.stats() for c in
                            (C_SEARCH, C_PAGE, C_META, C_EMBED, C_N1, C_STREAM)],
                 "stale": len(C_STALE), "reqlog_len": len(_REQLOG),
@@ -1892,6 +2020,9 @@ class Handler(BaseHTTPRequestHandler):
             tr["subs"] = len(cards[0].get("subtitles", [])) if cards else 0
             tr["ms"] = int((time.time() - t0) * 1000)
             return self._send(200, tr)
+        if path == "/debug/net":
+            only = (q.get("probe") or [""])[0] or None
+            return self._send(200, _net_probe(only))
         if path == "/debug/mem":
             try:
                 rss = int(open("/proc/self/status").read()
@@ -1904,6 +2035,57 @@ class Handler(BaseHTTPRequestHandler):
                                                 C_N1, C_STREAM)],
                                     "stale": len(C_STALE)})
         return self._send(404, {"error": "not found"})
+
+
+def _net_probe(only=None):
+    """Diagnostic: is THIS egress (Render singapore) blocked per host, and does a
+    free exit fix it? One direct + one proxied request per probe, head-only
+    bodies, so it costs a little latency and no media bandwidth."""
+    probes = [
+        ("site_home", SITE + "/", None),
+        ("site_autocomplete", SITE + "/home/autocompleteajax?term=mirzapur", SITE + "/"),
+        ("site_watch", SITE + "/watch/mirzapur-the-movie.html", SITE + "/"),
+        ("embed", "https://plextream.work/embed.php?id=GKHsp0bk", None),
+        ("n1_api", "https://bpx.strp2p.site/api/v1/video?id=ow99qd",
+         "https://bpx.strp2p.site/"),
+    ]
+    hd0 = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
+    exits = _pool_order()
+    out = {"pool": _pool_stats(), "exit_used": (exits or [None])[0], "probes": {}}
+    for name, url, ref in probes:
+        if only and only != name:
+            continue
+        hd = dict(hd0)
+        if ref:
+            hd["Referer"] = ref
+        row = {}
+        t0 = time.time()
+        try:
+            r = _S.get(url, headers=hd, timeout=10)
+            row["direct"] = [r.status_code, len(r.text or ""),
+                             int((time.time() - t0) * 1000),
+                             (r.text or "")[:70].replace("\n", " ")]
+        except Exception as e:
+            row["direct"] = ["EXC", type(e).__name__,
+                             int((time.time() - t0) * 1000), ""]
+        row["proxy"] = ["NO_EXIT", "", 0, ""]
+        if exits:
+            u = exits[0]
+            t1 = time.time()
+            try:
+                r = _S.get(url, headers=hd, timeout=POOL_TO,
+                           proxies={"http": u, "https": u})
+                bad = r.status_code in (403, 503)
+                row["proxy"] = [r.status_code, len(r.text or ""),
+                                int((time.time() - t1) * 1000),
+                                (r.text or "")[:70].replace("\n", " ")]
+                _pool_note(u, not bad, blocked=bad)
+            except Exception as e:
+                row["proxy"] = ["EXC", type(e).__name__,
+                                int((time.time() - t1) * 1000), ""]
+                _pool_note(u, False)
+        out["probes"][name] = row
+    return out
 
 
 # ══════════════════════════════════════════════════════ 16. KEEPALIVE/WATCHDOG

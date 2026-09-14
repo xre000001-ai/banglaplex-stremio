@@ -1386,6 +1386,145 @@ def test_debug_resolve_and_chain_routes_exist():
     assert d2 == {"ok": False}
 
 
+# ════════════════════════════════════════════════════ 15b. proxy pool (Render egress)
+def _pool_reset():
+    addon._POOL[0] = ["http://1.1.1.1:8080", "http://2.2.2.2:8080",
+                      "http://3.3.3.3:8080"]
+    addon._POOL_TS[0] = time.time()
+    addon._POOL_BAD.clear()
+    addon._POOL_OK.clear()
+    addon._STICKY[0], addon._STICKY[1] = None, 0.0
+    addon._DIRECT_BAD.clear()
+
+
+def test_pool_refresh_parses_proxyscrape_text():
+    txt = "http://1.2.3.4:8080\n5.6.7.8:3128\n\n# comment\nhttp://1.2.3.4:8080\n"
+    with mock.patch.object(addon.requests, "get", return_value=_resp(200, txt)):
+        addon._POOL[0] = []
+        addon._POOL_TS[0] = 0.0
+        out = addon._pool_refresh(force=True)
+    assert out == ["http://1.2.3.4:8080", "http://5.6.7.8:3128"], out
+
+
+def test_pool_refresh_keeps_old_list_on_failure():
+    _pool_reset()
+    before = list(addon._POOL[0])
+    with mock.patch.object(addon.requests, "get", side_effect=RuntimeError("down")):
+        addon._POOL_TS[0] = 0.0
+        out = addon._pool_refresh(force=True)
+    assert out == before, "a failed refresh must not empty a working pool"
+
+
+def test_pool_order_sticky_and_benching():
+    _pool_reset()
+    assert addon._pool_order()[0] == "http://1.1.1.1:8080"
+    addon._pool_note("http://2.2.2.2:8080", True)
+    assert addon._pool_order()[0] == "http://2.2.2.2:8080", "a good exit goes sticky"
+    addon._pool_note("http://2.2.2.2:8080", False, blocked=True)
+    assert "http://2.2.2.2:8080" not in addon._pool_order()
+    assert addon._POOL_BAD["http://2.2.2.2:8080"] - time.time() > 600
+    addon._pool_note("http://3.3.3.3:8080", False)
+    assert addon._POOL_BAD["http://3.3.3.3:8080"] - time.time() < 600
+
+
+def test_fetch_direct_when_host_answers():
+    _pool_reset()
+    calls = []
+    with mock.patch.object(addon._S, "get",
+                           side_effect=lambda u, **k: calls.append(k.get("proxies")) or _resp(200, "ok")):
+        r, via = addon._fetch("https://banglaplex.biz/x")
+    assert r.status_code == 200 and via is False
+    assert calls == [None], "a healthy direct route must not touch the pool"
+
+
+def test_fetch_falls_back_to_pool_on_403_in_the_same_call():
+    """Render's egress is Cloudflare-flagged: the user must never see the first
+    failure, and the host must stop paying for a direct attempt afterwards."""
+    _pool_reset()
+    seq = [_resp(403, "cf challenge"), _resp(200, "<html>watch</html>")]
+    used = []
+
+    def fake(u, **k):
+        used.append(k.get("proxies"))
+        return seq.pop(0)
+    with mock.patch.object(addon._S, "get", side_effect=fake):
+        r, via = addon._fetch("https://banglaplex.biz/watch/x.html")
+    assert r.status_code == 200 and via is True
+    assert used[0] is None and used[1] == {"http": "http://1.1.1.1:8080",
+                                           "https": "http://1.1.1.1:8080"}
+    assert addon._DIRECT_BAD["banglaplex.biz"] > time.time()
+    used2 = []
+    with mock.patch.object(addon._S, "get",
+                           side_effect=lambda u, **k: used2.append(k.get("proxies")) or _resp(200, "ok")):
+        r2, via2 = addon._fetch("https://banglaplex.biz/watch/y.html")
+    assert via2 is True and used2[0] is not None
+
+
+def test_fetch_walks_exits_until_one_works():
+    _pool_reset()
+    seq = [_resp(403, ""), RuntimeError("dead exit"), _resp(200, "ok")]
+
+    def fake(u, **k):
+        if k.get("proxies") is None:
+            raise RuntimeError("direct down")
+        v = seq.pop(0)
+        if isinstance(v, Exception):
+            raise v
+        return v
+    with mock.patch.object(addon._S, "get", side_effect=fake):
+        r, via = addon._fetch("https://banglaplex.biz/x")
+    assert via is True and r.status_code == 200
+    assert len(addon._POOL_BAD) >= 1
+
+
+def test_fetch_all_exits_dead_is_transient_none():
+    _pool_reset()
+    with mock.patch.object(addon._S, "get", side_effect=RuntimeError("nope")):
+        r, via = addon._fetch("https://banglaplex.biz/x")
+    assert r is None
+
+
+def test_range_probe_never_uses_a_proxy():
+    """media playability must be proven on a normal client path, and no media
+    byte may ride a free exit."""
+    _pool_reset()
+    addon._DIRECT_BAD["p16-ad-site-sign-sg.tiktokcdn.com"] = time.time() + 600
+    used = []
+
+    class FakeR:
+        status_code = 206
+
+        def iter_content(self, n):
+            yield b"x" * 300
+
+        def close(self):
+            pass
+    with mock.patch.object(addon._S, "get",
+                           side_effect=lambda u, **k: used.append(k.get("proxies")) or FakeR()):
+        code, n = addon._range_probe("https://p16-ad-site-sign-sg.tiktokcdn.com/seg.ts")
+    assert code == 206 and n == 300, (code, n)   # nbytes only sizes the Range header
+    assert used == [None], used
+
+
+def test_pool_kill_switch():
+    _pool_reset()
+    with mock.patch.object(addon, "POOL_ON", False):
+        assert addon._pool_refresh() == []
+        with mock.patch.object(addon._S, "get", return_value=_resp(403, "cf")):
+            r, via = addon._fetch("https://banglaplex.biz/x")
+    assert via is False and r.status_code == 403
+
+
+def test_net_probe_reports_both_paths():
+    _pool_reset()
+    with mock.patch.object(addon._S, "get", return_value=_resp(403, "cf")):
+        d = addon._net_probe(only="site_home")
+    assert list(d["probes"]) == ["site_home"]
+    assert d["probes"]["site_home"]["direct"][0] == 403
+    assert d["probes"]["site_home"]["proxy"][0] == 403
+    assert d["pool"]["pool"] == 3
+
+
 # ═════════════════════════════════════════════ 16. zero-bandwidth contract
 def test_zero_bandwidth_no_media_routes():
     """Render must never carry a media byte: no playlist/segment/subtitle relay
