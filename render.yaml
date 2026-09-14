@@ -1,0 +1,23 @@
+# Render blueprint — New +  -> Blueprint -> pick this repo.
+# After the first deploy, set BPX_PUBLIC_URL to the service URL so the
+# keepalive self-ping has an address (it also learns it from the first
+# request's Host header, so this is optional).
+services:
+  - type: web
+    name: banglaplex-stremio
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python3 addon.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: BPX_WALL
+        value: "22"
+      - key: BPX_MAX_CARDS
+        value: "3"
+      - key: BPX_PUBLIC_URL
+        sync: false
