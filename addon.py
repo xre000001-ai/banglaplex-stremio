@@ -50,7 +50,7 @@ from urllib.parse import quote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.1.1"
+VERSION    = "1.1.2"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -2125,20 +2125,16 @@ def _net_probe(only=None):
                              int((time.time() - t0) * 1000), ""]
         row["proxy"] = ["NO_EXIT", "", 0, ""]
         if exits:
-            u = exits[0]
+            # race exactly like the real fetch path: probing a single exit
+            # reported ReadTimeout while resolves through the pool worked fine
             t1 = time.time()
-            try:
-                r = _S.get(url, headers=hd, timeout=POOL_TO,
-                           proxies={"http": u, "https": u})
-                bad = r.status_code in (403, 503)
+            r = _pool_get(url, hd, POOL_TO)
+            if r is None:
+                row["proxy"] = ["ALL_DEAD", "", int((time.time() - t1) * 1000), ""]
+            else:
                 row["proxy"] = [r.status_code, len(r.text or ""),
                                 int((time.time() - t1) * 1000),
                                 (r.text or "")[:70].replace("\n", " ")]
-                _pool_note(u, not bad, blocked=bad)
-            except Exception as e:
-                row["proxy"] = ["EXC", type(e).__name__,
-                                int((time.time() - t1) * 1000), ""]
-                _pool_note(u, False)
         out["probes"][name] = row
     return out
 

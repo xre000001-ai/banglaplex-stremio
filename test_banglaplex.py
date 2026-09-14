@@ -1516,12 +1516,26 @@ def test_pool_kill_switch():
 
 
 def test_net_probe_reports_both_paths():
+    """the probe must race the pool exactly like a real fetch — probing one exit
+    reported ReadTimeout on prod while resolves through the pool worked fine."""
     _pool_reset()
-    with mock.patch.object(addon._S, "get", return_value=_resp(403, "cf")):
+    good = _resp(200, "<html>site</html>")
+    seen = []
+
+    def fake(u, **k):
+        seen.append(k.get("proxies"))
+        if k.get("proxies") is None:
+            return _resp(403, "cf")            # direct blocked from Render
+        if (k["proxies"]["http"]) == "http://1.1.1.1:8080":
+            raise RuntimeError("dead")
+        return good                            # a later exit works
+    with mock.patch.object(addon._S, "get", side_effect=fake):
         d = addon._net_probe(only="site_home")
     assert list(d["probes"]) == ["site_home"]
-    assert d["probes"]["site_home"]["direct"][0] == 403
-    assert d["probes"]["site_home"]["proxy"][0] == 403
+    row = d["probes"]["site_home"]
+    assert row["direct"][0] == 403
+    assert row["proxy"][0] == 200, row["proxy"]
+    assert len(seen) > 2, "the probe must race several exits, not just one"
     assert d["pool"]["pool"] == 3
 
 
