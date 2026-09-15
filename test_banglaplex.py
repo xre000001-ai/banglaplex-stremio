@@ -2741,10 +2741,21 @@ def test_resolve_abyss_emits_verified_cards_with_referer_headers():
         assert c["_tier"] == "", "a declared label earns no measured tier claim"
 
 
-def test_browser_card_appears_only_when_no_native_card_can_seek():
-    """The queens fixture has all three sources above ABYSS_RANGE_MAX, so none of
-    the native cards can seek — that is the only situation where pointing a user
-    at the site's own browser player adds something."""
+def _cfg(**over):
+    c = dict(addon.CFG_DEFAULTS)
+    c.update({k: str(v) for k, v in over.items()})
+    return c
+
+
+def _ext_of(cards):
+    return [c for c in cards if c.get("externalUrl")]
+
+
+def test_browser_card_is_built_once_and_cfg_decides_who_sees_it():
+    """The build cache is shared by every install, so the browser card is BUILT
+    whenever a verified abyss card exists and `bc` decides per request. Building it
+    conditionally on one request's config would poison the cache for everyone
+    else. queens' three sources are all above ABYSS_RANGE_MAX -> none can seek."""
     cards, _pr, _m = _abyss_fixture_cards()
     ext = [c for c in cards if c.get("_ext")]
     assert len(ext) == 1, [c["name"] for c in cards]
@@ -2754,14 +2765,49 @@ def test_browser_card_appears_only_when_no_native_card_can_seek():
     assert "behaviorHints" not in e, "a browser card needs no proxy headers"
     assert "browser" in e["name"] and "seeking works" in e["description"]
     assert e["_cdn"] == "abyss-web"
+    assert [c["_seek"] for c in cards if not c.get("_ext")] == [0, 0, 0]
 
     with mock.patch.object(addon, "ABYSS_RANGE_MAX", 10 ** 12):
-        seekable, _p, _m2 = _abyss_fixture_cards()     # every file now in range
-    assert not [c for c in seekable if c.get("_ext")], "nothing to fall back to"
+        seekable, _p, _m2 = _abyss_fixture_cards()   # every file now in range
+    assert [c["_seek"] for c in seekable if not c.get("_ext")] == [1, 1, 1]
+
+    # bc: 0 never · 1 only when nothing offered can seek · 2 always
+    assert not _ext_of(addon.apply_cfg(cards, _cfg(bc="0")))
+    assert _ext_of(addon.apply_cfg(cards, _cfg(bc="1"))), "nothing can seek"
+    assert _ext_of(addon.apply_cfg(cards, _cfg(bc="2")))
+    assert not _ext_of(addon.apply_cfg(seekable, _cfg(bc="1"))), "native can seek"
+    assert _ext_of(addon.apply_cfg(seekable, _cfg(bc="2")))
 
     with mock.patch.object(addon, "BROWSER_CARD_ON", False):
-        off, _p, _m3 = _abyss_fixture_cards()          # env kill switch
-    assert len(off) == 3 and not [c for c in off if c.get("_ext")]
+        off, _p, _m3 = _abyss_fixture_cards()        # env kill switch
+    assert not [c for c in off if c.get("_ext")]
+
+
+def test_aby_off_drops_abyss_cards_and_leaves_3n1_alone():
+    cards, _pr, _m = _abyss_fixture_cards()
+    assert addon.apply_cfg(cards, _cfg(aby="0")) == [], "an off switch means off"
+    assert len(addon.apply_cfg([_card()], _cfg(aby="0"))) == 1
+    # the switch also suppresses the browser card even with bc=2
+    assert not _ext_of(addon.apply_cfg(cards, _cfg(aby="0", bc="2")))
+
+
+def test_seekable_first_reorders_without_disturbing_quality_order():
+    a = {"name": "1080p", "_cdn": "abyss", "_res": "1080p", "_seek": 0, "url": "u1"}
+    b = {"name": "720p", "_cdn": "abyss", "_res": "720p", "_seek": 0, "url": "u2"}
+    c = {"name": "480p", "_cdn": "abyss", "_res": "480p", "_seek": 1, "url": "u3"}
+    assert [x["name"] for x in addon.apply_cfg([a, b, c], _cfg(sq="0"))] == \
+        ["1080p", "720p", "480p"]
+    assert [x["name"] for x in addon.apply_cfg([a, b, c], _cfg(sq="1"))] == \
+        ["480p", "1080p", "720p"], "stable sort keeps quality order inside a group"
+    # something can seek now, so bc=1 has nothing to add
+    assert not _ext_of(addon.apply_cfg([a, b, c], _cfg(sq="1", bc="1")))
+
+
+def test_private_markers_never_reach_the_player():
+    cards, _pr, _m = _abyss_fixture_cards()
+    for c in addon.apply_cfg(cards, _cfg(bc="2")):
+        for k in ("_cdn", "_res", "_tier", "_nsubs", "_ext", "_seek"):
+            assert k not in c, (k, c["name"])
 
 
 def test_browser_card_never_replaces_a_verified_card():
@@ -2833,17 +2879,25 @@ def test_player_route_rejects_anything_that_is_not_a_plain_id():
         assert c["code"] == 404, (bad, c["code"])
 
 
-def test_config_page_exposes_the_browser_card_toggle():
-    c = _http_get("/configure")
-    body = c["body"].decode("utf-8")
-    assert 'id="bc"' in body and "seeking works" in body
-    assert '"bc"' in body, "the default config must carry bc so the UI can bind it"
+def test_config_page_has_an_abyss_section_with_all_three_controls():
+    body = _http_get("/configure")["body"].decode("utf-8")
+    assert "Abyss &amp; seeking" in body
+    for i in ("aby", "bc", "sq"):
+        assert 'id="%s"' % i in body, i
+        assert '"%s"' % i in body, "the default config must carry %s for the JS" % i
+    assert "Only when nothing else can seek" in body
+    assert "Always, alongside the qualities" in body
+    assert "Seekable files first" in body
+    assert "never through this service" in body, "say the bandwidth rule out loud"
+    assert body.count('id="bc"') == 1, "the old buried row must be gone"
 
 
-def test_cfg_round_trips_the_bc_toggle():
-    assert addon.cfg_unpack(addon.cfg_pack({"bc": "0"}))["bc"] == "0"
-    assert addon.cfg_unpack(addon.cfg_pack({"bc": "1"}))["bc"] == "1"
-    assert addon.cfg_unpack(addon.cfg_pack({"bc": "nonsense"}))["bc"] == "1"
+def test_cfg_round_trips_the_abyss_toggles():
+    for k, v in (("bc", "0"), ("bc", "2"), ("aby", "0"), ("sq", "1")):
+        assert addon.cfg_unpack(addon.cfg_pack({k: v}))[k] == v, (k, v)
+    assert addon.cfg_unpack(addon.cfg_pack({"bc": "9"}))["bc"] == "1"
+    assert addon.cfg_unpack(addon.cfg_pack({"aby": "nope"}))["aby"] == "1"
+    assert addon.cfg_unpack(addon.cfg_pack({"sq": "x"}))["sq"] == "0"
 
 
 def test_resolve_abyss_refuses_an_origin_that_will_not_serve_ftyp():

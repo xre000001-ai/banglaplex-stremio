@@ -51,7 +51,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.5.0"
+VERSION    = "1.6.0"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -1788,7 +1788,6 @@ def resolve_abyss(abyss_url, page=None, note="", ctype="movie", se=None, ep=None
         picks.append((src, url, seekable,
                       _V_EX.submit(_abyss_probe, url, seekable)))
     cards = []
-    seek_any = False
     budget = max(0.5, (deadline or (time.time() + 20)) - time.time())
     for src, url, seekable, f in picks:
         if len(cards) >= MAX_CARDS:
@@ -1802,7 +1801,6 @@ def resolve_abyss(abyss_url, page=None, note="", ctype="movie", se=None, ep=None
             _STATS["abyss_fail"] = _STATS.get("abyss_fail", 0) + 1
             continue
         _STATS["abyss_ok"] = _STATS.get("abyss_ok", 0) + 1
-        seek_any = seek_any or bool(seekable)
         info = {"best": (0, 0), "label": src["label"], "size": src["size"],
                 "media_size": src["size"], "codec": src["codec"],
                 "seekable": seekable, "probe": code}
@@ -1810,9 +1808,16 @@ def resolve_abyss(abyss_url, page=None, note="", ctype="movie", se=None, ep=None
         if not seekable:
             # honest about the one thing this path cannot do
             n = (n + " ◇ " if n else "") + "no seeking (plays straight through)"
-        cards.append(format_card("abyss", url, ABYSS_REFERER, "Abyss", info, pg,
-                                 {}, note=n))
-    if cards and not seek_any and BROWSER_CARD_ON:
+        c = format_card("abyss", url, ABYSS_REFERER, "Abyss", info, pg, {}, note=n)
+        # `_seek` drives the browser-card rule and the seekable-first ordering in
+        # apply_cfg. A missing marker means seekable, so 3n1 HLS cards (which are)
+        # need no marker at all.
+        c["_seek"] = 1 if seekable else 0
+        cards.append(c)
+    if cards and BROWSER_CARD_ON:
+        # built whenever it COULD be wanted; `bc` decides per install (never /
+        # only when nothing can seek / always). Building it conditionally on the
+        # request's config would poison the shared cache.
         bc = browser_card(abyss_url, srcs, pg, note)
         if bc:
             cards.append(bc)
@@ -2140,6 +2145,7 @@ def _cap_cards(cards):
     rides along outside that budget (apply_cfg enforces the same rule per config)."""
     ext = [c for c in cards if c.get("_ext")]
     return [c for c in cards if not c.get("_ext")][:MAX_CARDS] + ext[:1]
+
 
 
 # ═══════════════════════════════════════════════════════ 13. BUILD PIPELINE
@@ -2517,7 +2523,10 @@ CFG_DEFAULTS = {
     "cdn": "both",         # "both" | "tiktok" | "cf"  (server preference)
     "cat": "all",          # "all" | "movie" | "series" | "off"
     "tmdb": "",            # the user's OWN TMDB v3 key — never stored server-side
-    "bc": "1",             # "1" = offer the browser card when nothing can seek
+    "aby": "1",            # "0" = drop every abyssplayer card
+    "bc": "1",             # browser card: "0" never · "1" only if nothing can seek
+                           #               "2" always (alongside the native cards)
+    "sq": "0",             # "1" = list seekable files before bigger unseekable ones
 }
 _CFG_TLS = threading.local()
 _Q_TIERS = {"all": 0, "720": 1, "1080": 2}
@@ -2566,8 +2575,11 @@ def cfg_unpack(seg):
             if v.lower() in allowed:
                 cfg[k] = v.lower()
         elif k == "bc":
-            if v in ("0", "1"):
+            if v in ("0", "1", "2"):
                 cfg["bc"] = v
+        elif k in ("aby", "sq"):
+            if v in ("0", "1"):
+                cfg[k] = v
         elif k == "tmdb":
             if re.fullmatch(r"[A-Za-z0-9]{20,64}", v):
                 cfg["tmdb"] = v
@@ -2595,6 +2607,11 @@ def apply_cfg(cards, cfg=None):
     all_cards = list(cards or [])
     ext = [c for c in all_cards if c.get("_ext")]      # browser fallback, if any
     media = [c for c in all_cards if not c.get("_ext")]
+    abyss_off = str(cfg.get("aby") or "1") == "0"
+    if abyss_off:
+        # an explicit off switch means off: no `or media` rescue, unlike the
+        # server-preference filter below which must never empty the list
+        media = [c for c in media if (c.get("_cdn") or "") not in ("abyss", "abyss-web")]
     pool = []
     for c in media:
         rank = _Q_RANK.get(c.get("_res") or "", 0)
@@ -2608,6 +2625,9 @@ def apply_cfg(cards, cfg=None):
         pool = [c for c in pool if "tiktok" in (c.get("_cdn") or "").lower()] or pool
     elif cdn == "cf" and pool:
         pool = [c for c in pool if "tiktok" not in (c.get("_cdn") or "").lower()] or pool
+    if str(cfg.get("sq") or "0") == "1":
+        # stable sort: seekable files first, quality order preserved inside each
+        pool.sort(key=lambda c: 0 if c.get("_seek", 1) else 1)
     for c in pool:
         c = dict(c)
         if subs_want is None:
@@ -2623,15 +2643,21 @@ def apply_cfg(cards, cfg=None):
                                           c.get("description") or "")
             else:
                 c.pop("subtitles", None)
-        for k in ("_cdn", "_res", "_tier", "_nsubs", "_ext"):
+        for k in ("_cdn", "_res", "_tier", "_nsubs", "_ext", "_seek"):
             c.pop(k, None)
         out.append(c)
     out = out[:max(1, int(cfg.get("n") or MAX_CARDS))]
-    if ext and BROWSER_CARD_ON and str(cfg.get("bc") or "1") != "0":
-        e = dict(ext[0])
-        for k in ("_cdn", "_res", "_tier", "_nsubs", "_ext"):
-            e.pop(k, None)
-        out.append(e)          # a playback mode, not another quality: outside `n`
+    bc = str(cfg.get("bc") or "1")
+    if ext and BROWSER_CARD_ON and not abyss_off and bc != "0":
+        # "1" = only when nothing the user was actually offered can seek (the
+        # capped list, not the build) · "2" = always
+        if bc == "2" or not any(c.get("_seek", 1) for c in pool[:max(
+                1, int(cfg.get("n") or MAX_CARDS))]):
+            e = dict(ext[0])
+            for k in ("_cdn", "_res", "_tier", "_nsubs", "_ext", "_seek"):
+                e.pop(k, None)
+            # a playback mode, not another quality: outside the `n` budget
+            out.append(e)
     return out
 
 
@@ -3310,16 +3336,31 @@ direct CDN streams, own catalogs, zero server bandwidth.</p>
 <select id="cdn"><option value="both">Both</option>
 <option value="tiktok">TikTok CDN first only</option>
 <option value="cf">Cloudflare only</option></select></div>
-<div class="row"><div><label>Browser card when nothing can seek</label>
-<span class="hint">Abyss files over 500&nbsp;MiB only play straight through in
-Stremio. This adds one extra card that opens the site's own player in a browser,
-where seeking works. It is offered only when no native card can seek, and no
-media passes through this service.</span></div>
-<select id="bc"><option value="1">Offer it</option>
-<option value="0">Never</option></select></div>
 <div class="row"><div><label>Subtitles</label>
 <span class="hint">Tap languages to reorder — leftmost wins</span></div>
 <div class="chips" id="subs"></div></div>
+</div>
+
+<div class="card"><h2>Abyss &amp; seeking</h2>
+<div class="row"><div><label>abyssplayer sources</label>
+<span class="hint">Most new Bangla series exist only on abyssplayer. Every card is
+verified against the origin before it is shown, and the video streams from their
+CDN straight to your player — never through this service.</span></div>
+<select id="aby"><option value="1">Use them</option>
+<option value="0">Never show abyss cards</option></select></div>
+<div class="row"><div><label>Big files cannot seek — offer a browser card?</label>
+<span class="hint">Above 500&nbsp;MiB the abyss origin stops honouring byte-range
+requests, so those cards play straight through with no scrubbing (the card says
+so). The browser card opens the site's own player, which seeks at any size. It
+never replaces a native card and never costs you one of your quality slots.</span></div>
+<select id="bc"><option value="1">Only when nothing else can seek</option>
+<option value="2">Always, alongside the qualities</option>
+<option value="0">Never</option></select></div>
+<div class="row"><div><label>Card order</label>
+<span class="hint">Seekable-first puts a smaller file you can scrub above a bigger
+one you cannot</span></div>
+<select id="sq"><option value="0">Best quality first</option>
+<option value="1">Seekable files first</option></select></div>
 </div>
 
 <div class="card"><h2>Catalogs</h2>
@@ -3365,7 +3406,7 @@ function buildUI(){
   for(let i=1;i<=NMAX;i++){const o=document.createElement("option");
     o.value=i;o.textContent=i+(i===1?" card":" cards");n.appendChild(o);}
   n.value=CFG.n; n.onchange=()=>{CFG.n=parseInt(n.value);render();};
-  for(const k of ["q","cdn","cat","bc"]){
+  for(const k of ["q","cdn","cat","bc","aby","sq"]){
     const el=document.getElementById(k); el.value=CFG[k];
     el.onchange=()=>{CFG[k]=el.value;render();};
   }

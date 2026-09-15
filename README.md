@@ -68,6 +68,12 @@ So when **none** of the verified native cards can seek, one extra card is emitte
 externalUrl → https://<host>/player/<abyss-id>
 ```
 
+The three knobs live in their own **Abyss & seeking** section on `/configure`:
+`aby` (use abyssplayer at all), `bc` (`1` only when nothing else can seek ·
+`2` always, alongside the qualities · `0` never) and `sq` (best quality first, or
+seekable first). They are enforced in `apply_cfg`, never in the build, so one
+verified build still serves every install.
+
 `/player/<id>` is a ~600-byte HTML shell that iframes `abyssplayer.com/<id>`. The
 iframe is the entire trick: that page carries anti-hotlink JS
 
@@ -86,11 +92,13 @@ Rules around it, all tested:
 
 - **Never replaces a native card** — it is appended after them, and a build that
   verified nothing emits no card of any kind (no phantom browser card).
-- **Only when nothing can seek.** If any quality is under the ceiling, the native
-  cards already do the job and no browser card is offered.
+- **Only when nothing can seek** (`bc=1`, the default). If any quality the user was
+  actually offered is under the ceiling, the native cards already do the job and no
+  browser card appears. `bc=2` offers it anyway, for players that prefer the site's
+  own UI; `bc=0` never does.
 - **Outside the `n` cap.** It is a different playback mode, not another quality,
-  so it never costs the user a 720p card. `bc=0` (config page) or
-  `BPX_BROWSER_CARD=0` turns it off entirely.
+  so it never costs the user a 720p card (`n=1` + `bc=2` = 2 cards).
+  `BPX_BROWSER_CARD=0` is the server-wide kill switch.
 - **Still zero media bytes.** Render serves the HTML shell; the browser pulls
   video from the abyss origin.
 
@@ -223,7 +231,9 @@ https://host/eyJjYXQiOiJzZXJpZXMifQ/manifest.json
 | `q` | `all` `720` `1080` | minimum resolution floor (unmeasured cards are never dropped) |
 | `cdn` | `both` `tiktok` `cf` | server preference — a *preference*: if the title only has the other server, that card still ships instead of an empty list |
 | `subs` | `en,hi,bn,…` or `off` | subtitle languages, leftmost wins (reorders + filters the track list and the `⟡ N SUB` label) |
-| `bc` | `1` `0` | offer the browser card when no native card can seek |
+| `aby` | `1` `0` | `0` drops every abyssplayer card (native *and* browser) |
+| `bc` | `1` `2` `0` | browser card: only when nothing offered can seek / always / never |
+| `sq` | `0` `1` | `1` lists seekable files before bigger unseekable ones |
 | `cat` | `all` `movie` `series` `off` | which shelves appear in the board |
 | `tmdb` | 32-char key | the user's own TMDB key for richer art (validated live via `/validate-key`) |
 
@@ -336,7 +346,7 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 | `BPX_CARDS` | `1` | `0` = kill switch, answers empty |
 | `BPX_INHOUSE` | `0` | `1` = also emit the IP-bound raw-IP path (debug only) |
 | `BPX_ABYSS` | `1` | `0` = kill switch for the abyssplayer path |
-| `BPX_BROWSER_CARD` | `1` | `0` = never offer the `/player/` iframe card |
+| `BPX_BROWSER_CARD` | `1` | `0` = never offer the `/player/` iframe card (per-install: `bc`) |
 | `BPX_PROXY` | `auto` | `0` = never use the free proxy pool |
 | `BPX_PROXY_SOURCE` | proxyscrape | free HTTP proxy list URL(s), comma-separated |
 | `BPX_PROXY_LIST` | *(none)* | hand-picked exits (`http://user:pass@host:port,…`) — always ride first |
@@ -352,7 +362,7 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 ## Tests
 
 ```bash
-python3 test_banglaplex.py           # 258 offline tests, every network call mocked
+python3 test_banglaplex.py           # 261 offline tests, every network call mocked
 BPX_LIVE=1 python3 test_banglaplex.py # + 4 live integration tests (real site/CDN)
 ```
 
