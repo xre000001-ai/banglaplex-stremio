@@ -51,7 +51,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.6.0"
+VERSION    = "1.6.1"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -2675,6 +2675,26 @@ _META_RES_TTL = 12 * 3600
 _PAGE_N = 24                                  # the site's own page size
 
 
+_SLUG_KIND = {}          # slug -> True(series) / False(movie), from shelf badges
+_SLUG_KIND_MAX = 4000
+
+
+def _note_kind(slug, is_series):
+    """Remember how the SITE classified a title, from its `label-tvseries` badge.
+
+    The autocomplete endpoint's own `type` field is worthless as a classifier:
+    measured on Dahan, Queens, Taarkata, Cactus, Gorki-R Ma and Prem Shots — all of
+    which sit on the site's series shelf — it answered `Movie` for every single
+    one. Search used to hard-filter on that field, so the series shelf's search box
+    returned **zero items for every query anyone could type**. The badge on the
+    listing grid is the reliable signal, so learn it as shelves are browsed."""
+    if not slug:
+        return
+    if len(_SLUG_KIND) >= _SLUG_KIND_MAX and slug not in _SLUG_KIND:
+        _SLUG_KIND.clear()
+    _SLUG_KIND[slug] = bool(is_series)
+
+
 def parse_listing(h):
     """OVOO card grid -> [{slug,url,title,poster,year,quality,series,rating}].
 
@@ -2707,6 +2727,8 @@ def parse_listing(h):
         qm = re.search(r'label-primary">\s*([^<]{1,20}?)\s*<', chunk)
         rm = re.search(r'IMDB\s*([\d.]+)', chunk)
         seen.add(slug)
+        is_series = "label-tvseries" in chunk
+        _note_kind(slug, is_series)
         out.append({
             "slug": slug,
             "url": SITE + "/watch/" + slug + ".html",
@@ -2714,7 +2736,7 @@ def parse_listing(h):
             "poster": _html.unescape(poster or (pm.group(1) if pm else "")).strip(),
             "year": int(ym.group(1)) if ym else None,
             "quality": _html.unescape(qm.group(1)).strip() if qm else "",
-            "series": "label-tvseries" in chunk,
+            "series": is_series,
             "rating": float(rm.group(1)) if rm and rm.group(1) not in ("0", "0.0") else 0.0,
             "trending": "video_trending_badge" in chunk,
         })
@@ -2968,18 +2990,23 @@ def catalog_items(ctype, cat_id, genre=None, search=None, skip=0, cfg=None):
         cands = _search_autocomplete(search.strip())
         if cands is None:
             return []                        # transient: empty now, retry later
-        items = []
+        match, other = [], []
         for c in cands[:_PAGE_N * 2]:
             slug = urlparse(c["url"]).path.split("/watch/")[-1].replace(".html", "")
-            is_series = "series" in (c.get("type") or "").lower() or "tv" in (c.get("type") or "").lower()
-            if ctype == "series" and not is_series:
-                continue
-            if ctype == "movie" and is_series:
-                continue
-            items.append({"slug": slug, "url": c["url"], "title": c["title"],
-                          "poster": c.get("image") or "", "year": _year_of(c["title"]),
-                          "quality": "", "series": is_series, "rating": 0.0})
-        items = items[:_PAGE_N]
+            kind = _SLUG_KIND.get(slug)      # the site's own badge, if we know it
+            if kind is None:
+                t = (c.get("type") or "").lower()
+                kind = ("series" in t) or ("tv" in t)
+            it = {"slug": slug, "url": c["url"], "title": c["title"],
+                  "poster": c.get("image") or "", "year": _year_of(c["title"]),
+                  "quality": "", "series": bool(kind), "rating": 0.0}
+            # Demote a mismatch, never drop it. The autocomplete `type` says Movie
+            # for real series, so a hard filter emptied the series shelf's search
+            # for every query — "Prem Shots is on the site but the addon doesn't
+            # show it". Both /meta and /stream resolve either type for the same id,
+            # so a demoted hit is still a working one; a dropped hit is a dead end.
+            (match if bool(kind) == (ctype == "series") else other).append(it)
+        items = (match + other)[:_PAGE_N]
     else:
         url, mode = catalog_source(cat_id, ctype, genre, skip)
         got = list_page(url)

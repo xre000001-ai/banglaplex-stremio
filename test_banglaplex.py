@@ -70,6 +70,7 @@ def clear_caches():
     addon._NEG_RETRY_AT.clear()
     addon._SWR_RUNNING.clear()
     addon._WALLED.clear()
+    addon._SLUG_KIND.clear()
     addon._PREWARM_BUSY[0] = False      # a killed prewarm must not leak "busy"
     # NOTE: never _STATS.clear() — it is a counter dict whose keys the /health
     # surface and the tests read directly; emptying it raises KeyError.
@@ -2309,8 +2310,60 @@ def test_catalog_items_search_uses_autocomplete():
          mock.patch.object(addon, "imdb_suggest_title", return_value=None):
         mov = addon.catalog_items("movie", "bpx-latest", search="mirzapur")
         ser = addon.catalog_items("series", "bpx-latest", search="mirzapur")
-    assert [m["id"] for m in mov] == ["bpx-mirzapur"]
-    assert [m["id"] for m in ser] == ["bpx-mirzapur-2024"]
+    # ordering, not exclusion: the site's `type` field is unreliable, so a
+    # mismatch is demoted rather than dropped
+    assert [m["id"] for m in mov] == ["bpx-mirzapur", "bpx-mirzapur-2024"]
+    assert [m["id"] for m in ser] == ["bpx-mirzapur-2024", "bpx-mirzapur"]
+
+
+def test_catalog_search_keeps_titles_the_site_labels_with_the_wrong_type():
+    """The reported bug — "Prem Shots is on the provider's site but the addon does
+    not show it". banglaplex.biz answers `type: "Movie"` for EVERY autocomplete hit
+    (measured: Dahan, Queens, Taarkata, Cactus, Gorki-R Ma, Prem Shots — all of them
+    sit on the site's own series shelf). Search hard-filtered on that field, so the
+    series board's search box returned zero items for every query anyone could
+    type. A mismatch demotes a hit now; it never deletes one."""
+    clear_caches()
+    cands = [{"title": "Prem Shots", "type": "Movie",
+              "url": "https://banglaplex.biz/watch/prem-shots.html", "image": ""}]
+    with mock.patch.object(addon, "_search_autocomplete", return_value=cands), \
+         mock.patch.object(addon, "imdb_suggest_title", return_value=None):
+        ser = addon.catalog_items("series", "bpx-series", search="prem shots")
+        mov = addon.catalog_items("movie", "bpx-latest", search="prem shots")
+    assert [m["name"] for m in ser] == ["Prem Shots"], "never a dead end"
+    assert [m["name"] for m in mov] == ["Prem Shots"]
+
+
+def test_parse_listing_teaches_the_slug_kind_index():
+    """The listing badge is the one reliable type signal, so browsing a shelf
+    teaches search how to ORDER its hits (a known match first)."""
+    clear_caches()
+    items = addon.parse_listing(_listing(2, series=True))
+    assert [i["slug"] for i in items] == ["title-0", "title-1"]
+    assert addon._SLUG_KIND["title-0"] is True and addon._SLUG_KIND["title-1"] is True
+    addon.parse_listing(_listing(1, series=False))
+    assert addon._SLUG_KIND["title-0"] is False, "the latest badge wins"
+
+    clear_caches()
+    addon._note_kind("known-series", True)
+    cands = [{"title": "Wrong Label", "type": "Movie",           # site lies
+              "url": "https://banglaplex.biz/watch/known-series.html", "image": ""},
+             {"title": "Unknown", "type": "Movie",
+              "url": "https://banglaplex.biz/watch/never-seen.html", "image": ""}]
+    with mock.patch.object(addon, "_search_autocomplete", return_value=cands), \
+         mock.patch.object(addon, "imdb_suggest_title", return_value=None):
+        ser = addon.catalog_items("series", "bpx-series", search="x")
+    assert [m["name"] for m in ser] == ["Wrong Label", "Unknown"]
+    assert ser[0]["id"] == "bpx-known-series"
+
+
+def test_slug_kind_index_is_bounded():
+    clear_caches()
+    for i in range(addon._SLUG_KIND_MAX + 50):
+        addon._note_kind("s%d" % i, True)
+    assert len(addon._SLUG_KIND) <= addon._SLUG_KIND_MAX + 1, len(addon._SLUG_KIND)
+    addon._note_kind("", True)
+    assert "" not in addon._SLUG_KIND
 
 
 def test_catalog_items_transient_search_is_empty_not_cached():
