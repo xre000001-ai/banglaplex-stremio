@@ -51,7 +51,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.6.1"
+VERSION    = "1.6.2"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -2990,7 +2990,8 @@ def catalog_items(ctype, cat_id, genre=None, search=None, skip=0, cfg=None):
         cands = _search_autocomplete(search.strip())
         if cands is None:
             return []                        # transient: empty now, retry later
-        match, other = [], []
+        want = _norm_title((search or "").strip())
+        scored = []
         for c in cands[:_PAGE_N * 2]:
             slug = urlparse(c["url"]).path.split("/watch/")[-1].replace(".html", "")
             kind = _SLUG_KIND.get(slug)      # the site's own badge, if we know it
@@ -3000,13 +3001,18 @@ def catalog_items(ctype, cat_id, genre=None, search=None, skip=0, cfg=None):
             it = {"slug": slug, "url": c["url"], "title": c["title"],
                   "poster": c.get("image") or "", "year": _year_of(c["title"]),
                   "quality": "", "series": bool(kind), "rating": 0.0}
-            # Demote a mismatch, never drop it. The autocomplete `type` says Movie
-            # for real series, so a hard filter emptied the series shelf's search
-            # for every query — "Prem Shots is on the site but the addon doesn't
-            # show it". Both /meta and /stream resolve either type for the same id,
-            # so a demoted hit is still a working one; a dropped hit is a dead end.
-            (match if bool(kind) == (ctype == "series") else other).append(it)
-        items = (match + other)[:_PAGE_N]
+            # Rank, never filter. The autocomplete `type` says Movie for real
+            # series, so a hard filter emptied the series shelf's search for every
+            # query — "Prem Shots is on the site but the addon doesn't show it".
+            # Both /meta and /stream resolve either type for the same id, so a
+            # demoted hit still plays; a dropped one is a dead end. An exact title
+            # match outranks a type mismatch: someone who typed the whole title
+            # wants that title, not the shelf's opinion of its type.
+            exact = 0 if _norm_title(c.get("title") or "") == want else 1
+            offkind = 0 if bool(kind) == (ctype == "series") else 1
+            scored.append((exact, offkind, len(scored), it))
+        scored.sort()
+        items = [x[3] for x in scored[:_PAGE_N]]
     else:
         url, mode = catalog_source(cat_id, ctype, genre, skip)
         got = list_page(url)

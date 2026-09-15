@@ -169,6 +169,19 @@ Three shelves scraped from the site itself, each with `search`, `genre` and
 **pagination on this site is path-based**: `/genre/action/24.html` is page 2 —
 `?page=2` is silently ignored and returns page 1 (measured).
 
+**Search ranks, it never filters.** The site's autocomplete answers
+`type: "Movie"` for *every* hit — measured on Dahan, Queens, Taarkata, Cactus,
+Gorki-R Ma and Prem Shots, all of which sit on the site's own series shelf. Search
+used to hard-filter on that field, which meant the series board's search box
+returned **zero items for every query anyone could type** ("it's on the site but
+the addon doesn't show it"). Hits are now ranked: an exact title match first, then
+a type match, then everything else — and nothing is ever dropped, because both
+`/meta` and `/stream` resolve either type for the same id, so a demoted hit still
+plays while a dropped one is a dead end. The one reliable type signal is the
+listing grid's `label-tvseries` badge, so browsing a shelf teaches a bounded
+`_SLUG_KIND` index that search consults; the browse path already filtered on that
+badge and is unchanged.
+
 Every card gets an id: an **IMDb `tt…`** when a suggestion matches title *and*
 year *and* type strictly, otherwise **`bpx-<slug>`**, a source id this addon can
 both stream and describe. A wrong `tt` would show another film's poster, which is
@@ -362,7 +375,7 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 ## Tests
 
 ```bash
-python3 test_banglaplex.py           # 261 offline tests, every network call mocked
+python3 test_banglaplex.py           # 266 offline tests, every network call mocked
 BPX_LIVE=1 python3 test_banglaplex.py # + 4 live integration tests (real site/CDN)
 ```
 

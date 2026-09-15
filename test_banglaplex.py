@@ -2311,9 +2311,43 @@ def test_catalog_items_search_uses_autocomplete():
         mov = addon.catalog_items("movie", "bpx-latest", search="mirzapur")
         ser = addon.catalog_items("series", "bpx-latest", search="mirzapur")
     # ordering, not exclusion: the site's `type` field is unreliable, so a
-    # mismatch is demoted rather than dropped
+    # mismatch is demoted rather than dropped — and "Mirzapur" is an EXACT match
+    # for the query, which outranks the type mismatch on the series shelf
     assert [m["id"] for m in mov] == ["bpx-mirzapur", "bpx-mirzapur-2024"]
-    assert [m["id"] for m in ser] == ["bpx-mirzapur-2024", "bpx-mirzapur"]
+    assert [m["id"] for m in ser] == ["bpx-mirzapur", "bpx-mirzapur-2024"]
+    assert [m["type"] for m in ser] == ["series", "series"], "served as the shelf's type"
+
+
+def test_catalog_search_ranks_an_exact_title_above_a_type_mismatch():
+    """Someone who typed the whole title wants that title. Once the badge index
+    knows prem-shots is a series, the MOVIE shelf used to push the exact match to
+    last place behind four fuzzy 'Prem…' hits."""
+    clear_caches()
+    addon._note_kind("prem-shots", True)
+    cands = [{"title": "Besh Korechi Prem Korechi", "type": "Movie",
+              "url": "https://banglaplex.biz/watch/besh-korechi-prem-korechi.html",
+              "image": ""},
+             {"title": "Prem Shots", "type": "Movie",
+              "url": "https://banglaplex.biz/watch/prem-shots.html", "image": ""}]
+    with mock.patch.object(addon, "_search_autocomplete", return_value=cands), \
+         mock.patch.object(addon, "imdb_suggest_title", return_value=None):
+        mov = addon.catalog_items("movie", "bpx-latest", search="Prem Shots")
+        ser = addon.catalog_items("series", "bpx-series", search="prem shots")
+    assert [m["name"] for m in mov] == ["Prem Shots", "Besh Korechi Prem Korechi"]
+    assert [m["name"] for m in ser] == ["Prem Shots", "Besh Korechi Prem Korechi"]
+
+
+def test_catalog_search_fuzzy_hits_still_prefer_the_right_type():
+    clear_caches()
+    addon._note_kind("dahan-series", True)
+    cands = [{"title": "Dahan Movie", "type": "Movie",
+              "url": "https://banglaplex.biz/watch/dahan-movie.html", "image": ""},
+             {"title": "Dahan Series", "type": "Movie",
+              "url": "https://banglaplex.biz/watch/dahan-series.html", "image": ""}]
+    with mock.patch.object(addon, "_search_autocomplete", return_value=cands), \
+         mock.patch.object(addon, "imdb_suggest_title", return_value=None):
+        ser = addon.catalog_items("series", "bpx-series", search="dahan")
+    assert [m["name"] for m in ser] == ["Dahan Series", "Dahan Movie"]
 
 
 def test_catalog_search_keeps_titles_the_site_labels_with_the_wrong_type():
