@@ -51,13 +51,13 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.6.2"
+VERSION    = "1.7.0"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
 EMBED_HOST = "plextream.work"
 N1_HOSTS   = ("bpx.strp2p.site", "bpx.rpmvid.site")   # 3n1 frontends (same software)
-ABYSS_HOST = "abyssplayer.com"                        # SoTrym — unsupported (honest skip)
+ABYSS_HOST = "abyssplayer.com"                        # SoTrym — Sora + browser fallback
 LEGACY_PLAYERS = ("bestx.stream", "chillx.top")       # dead TLS on old catalog entries
 
 # 3n1 AES-128-CBC constants (reversed from the frontend bundle, verified live)
@@ -199,24 +199,38 @@ _NEG_RETRY_AT = {}
 _SWR_RUNNING = set()
 _SWR_LOCK = threading.Lock()
 
-_IO_EX   = ThreadPoolExecutor(max_workers=12, thread_name_prefix="io")
+_IO_EX   = ThreadPoolExecutor(max_workers=24, thread_name_prefix="io")
 # 6 verify workers starved as soon as a resolve had both an HLS candidate set and
 # three abyss qualities to probe: three concurrent taps pushed the slowest past
 # the answer wall. These are all blocking sockets, not CPU, so threads are cheap.
-_V_EX    = ThreadPoolExecutor(max_workers=14, thread_name_prefix="verify")
-_P_EX    = ThreadPoolExecutor(max_workers=10, thread_name_prefix="proxy")
-_PP_EX   = ThreadPoolExecutor(max_workers=16, thread_name_prefix="poolprobe")
+_V_EX    = ThreadPoolExecutor(max_workers=24, thread_name_prefix="verify")
+_P_EX    = ThreadPoolExecutor(max_workers=24, thread_name_prefix="proxy")
+_PP_EX   = ThreadPoolExecutor(max_workers=24, thread_name_prefix="poolprobe")
 # 2 builds meant a third concurrent tap could only wait; a build that outlives the
 # wall still pays off now (see _adopt_late_result), but waiting is not resolving.
-_BUILD_EX = ThreadPoolExecutor(max_workers=4, thread_name_prefix="build")
+_BUILD_EX = ThreadPoolExecutor(max_workers=8, thread_name_prefix="build")
+
+# One resolver per title/episode. A shelf tap can fan out from many devices at
+# once; sharing the Future prevents an N-user thundering herd of proxy/N1 calls.
+_BUILD_INFLIGHT = {}
+_BUILD_LOCK = threading.Lock()
 
 _S = requests.Session()
 _S.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
+try:
+    from requests.adapters import HTTPAdapter
+    _ADAPTER = HTTPAdapter(pool_connections=64, pool_maxsize=64, max_retries=0,
+                           pool_block=False)
+    _S.mount("http://", _ADAPTER)
+    _S.mount("https://", _ADAPTER)
+except Exception:
+    pass
 
 _REQLOG = []
 _REQLOG_LOCK = threading.Lock()
 _STATS = {"started": time.time(), "resolves": 0, "cards": 0, "empties": 0,
-          "n1_calls": 0, "n1_429": 0, "relay_bytes": 0, "slug_hits": 0}
+          "n1_calls": 0, "n1_429": 0, "relay_bytes": 0, "slug_hits": 0,
+          "build_coalesced": 0}
 
 
 def _log(entry):
@@ -470,23 +484,31 @@ def n1_decrypt(hexstr):
 # and the moment a host proves blocked from here, ride the free proxy pool
 # (house pattern — MovieBox §19). Nothing media-bearing ever goes through a
 # proxy: cards still point the player straight at the CDN.
-POOL_SRCS = [s.strip() for s in os.environ.get(
-    "BPX_PROXY_SOURCE",
+_DEFAULT_POOL_SRCS = ",".join((
     "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies"
-    "&proxy_type=http&proxy_format=protocolipport&format=text").split(",") if s.strip()]
+    "&proxy_type=http&proxy_format=protocolipport&format=text",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+))
+POOL_SRCS = [s.strip() for s in os.environ.get(
+    "BPX_PROXY_SOURCE", _DEFAULT_POOL_SRCS).split(",") if s.strip()]
 # hand-picked exits (paid/reliable) always ride first and are never evicted by
 # the free-list trainer: BPX_PROXY_LIST="http://user:pass@host:port,http://h2:p2"
 POOL_MANUAL = [s.strip() for s in os.environ.get("BPX_PROXY_LIST", "").split(",")
                if s.strip()]
 POOL_ON   = os.environ.get("BPX_PROXY", "auto") != "0"
-POOL_TTL  = 300.0          # re-pull the source list every 5 min
-POOL_MAX  = int(os.environ.get("BPX_POOL_MAX", "20"))   # trained exits kept
-POOL_CAND = 90             # candidates pulled from the sources per refresh
-POOL_TRY  = int(os.environ.get("BPX_PROXY_TRY", "5"))   # exits raced per fetch
-POOL_TO   = 8.0            # per-exit connect/read timeout (free proxies are slow)
-PROBE_TO  = 6.0            # training probe timeout
-PROBE_WAVE = 45            # wave size: publish as soon as wave 1 lands
+POOL_TTL  = 600.0          # re-pull the source list every 10 min; refresh is SWR
+POOL_MAX  = int(os.environ.get("BPX_POOL_MAX", "32"))   # trained exits kept
+POOL_CAND = 160            # candidates pulled from the sources per refresh
+POOL_TRY  = int(os.environ.get("BPX_PROXY_TRY", "3"))   # exits raced per fetch; 3x fan-out is enough
+POOL_TO   = 5.5            # per-exit connect/read timeout; losers are raced, not serialized
+PROBE_TO  = 4.5            # training probe timeout
+PROBE_WAVE = 48            # wave size: publish as soon as wave 1 lands
 DIRECT_BLOCK_TTL = 600.0   # host benched for direct egress after a 403/503
+POOL_PULL_TO = 6.0          # source-list pulls happen in the background
+POOL_BOOT_WAIT = float(os.environ.get("BPX_POOL_BOOT_WAIT", "1.8"))
+_POOL_PULLING = [False]      # source-list single-flight
+_POOL_READY = threading.Event()
 
 _HOST_BLOCK = {}
 _HOST_BLOCK_LOCK = threading.Lock()
@@ -518,22 +540,31 @@ def _blocked_left(host=None):
 
 
 def _pool_pull():
-    """Free-list sources -> deduped http(s) candidates.
+    """Free-list sources -> deduped HTTP(S) candidates.
 
-    socks4/socks5 exits need PySocks; without it requests raises InvalidSchema,
-    so every such exit looks "dead" (measured on prod: 40/40 exits were socks4
-    and the whole pool was unusable)."""
+    This is deliberately only a *text-list* fetch. It never sees media. SOCKS
+    exits are discarded because PySocks is not installed and every such exit
+    previously looked dead (measured: 40/40 candidates unusable). Source pulls
+    run in the refresh thread, never in the player-facing resolver."""
     urls = list(POOL_MANUAL)
     for src in POOL_SRCS:
         try:
-            r = requests.get(src, timeout=12, headers={"User-Agent": UA})
-            for ln in (r.text or "").splitlines():
+            r = requests.get(src, timeout=POOL_PULL_TO,
+                             headers={"User-Agent": UA, "Accept": "text/plain,*/*"})
+            try:
+                body = r.text or ""
+            finally:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            for ln in body.splitlines():
                 ln = ln.strip().strip(",")
                 if not ln or ln.startswith("#") or ":" not in ln:
                     continue
                 if "://" not in ln:
                     ln = "http://" + ln
-                if ln.split("://")[0] not in ("http", "https"):
+                if ln.split("://", 1)[0].lower() not in ("http", "https"):
                     continue
                 urls.append(ln)
         except Exception:
@@ -567,11 +598,11 @@ def _site_probe(u, timeout=None):
 
 
 def _pool_train(cands):
-    """Background trainer (MovieBox pattern): platform-probe the candidates in
-    parallel waves, publish wave 1 immediately so a usable pool exists early,
-    then keep the POOL_MAX fastest good exits, MERGED with the healthy members
-    already trained (never wholesale-replace: that throws away latency records
-    and the sticky pick)."""
+    """Background trainer: probe waves, publish early, merge with known-good.
+
+    A request can use the untrained list immediately; the trainer only changes
+    ordering and circuit-breaker state. That is the important cold-start change:
+    proxy-list download and 48 socket probes no longer sit in front of a user."""
     now = time.time()
     with _POOL_LOCK:
         prev = [u for u in _POOL[0] if _POOL_BAD.get(u, 0.0) <= now]
@@ -579,16 +610,22 @@ def _pool_train(cands):
     def wave(batch):
         got = []
         futs = {_PP_EX.submit(_site_probe, u): u for u in batch}
-        for f in as_completed(futs, timeout=PROBE_TO + 12):
-            u = futs[f]
-            try:
-                kind, ms = f.result(timeout=0)
-            except Exception:
-                kind, ms = "dead", 9999
-            if kind == "good":
-                got.append((u, ms))
-            else:
-                _pool_note(u, False, blocked=(kind == "blocked"))
+        try:
+            iterator = as_completed(futs, timeout=PROBE_TO + 8)
+            for f in iterator:
+                u = futs[f]
+                try:
+                    kind, ms = f.result(timeout=0)
+                except Exception:
+                    kind, ms = "dead", 9999
+                if kind == "good":
+                    got.append((u, ms))
+                else:
+                    _pool_note(u, False, blocked=(kind == "blocked"))
+        except Exception:
+            # A timed-out wave is still useful: already-completed good exits are
+            # retained, and unfinished futures will be abandoned by the executor.
+            pass
         return got
 
     alive = []
@@ -616,50 +653,104 @@ def _pool_train(cands):
 
 
 def _pool_publish(prev, best):
-    """MERGE previous healthy members with the newly proven fastest ones."""
-    lat = {u: (_POOL_STATS.get(u) or {}).get("lat") for u in prev}
-
-    def key(u):
-        return (lat.get(u) if lat.get(u) else 9999, u)
-    merged = list(dict.fromkeys([u for u, _ in best] if best and isinstance(best[0], tuple)
-                                else list(best)))
+    """MERGE previous healthy members with newly proven fastest ones."""
+    merged = list(dict.fromkeys([u for u, _ in best] if best and
+                                isinstance(best[0], tuple) else list(best)))
     with _POOL_LOCK:
         out = list(dict.fromkeys(POOL_MANUAL + prev + merged))
         out.sort(key=lambda u: ((_POOL_STATS.get(u) or {}).get("lat") or 9999))
         _POOL[0] = out[:max(POOL_MAX, len(POOL_MANUAL))]
 
 
+def _pool_start_training(cands):
+    """At most one trainer; never called on the request's critical path."""
+    if not cands:
+        return
+    with _POOL_LOCK:
+        if _TRAINING[0]:
+            return
+        _TRAINING[0] = True
+
+    def run():
+        try:
+            _pool_train(cands)
+        finally:
+            _TRAINING[0] = False
+    try:
+        threading.Thread(target=run, daemon=True, name="pooltrain").start()
+    except Exception:
+        _TRAINING[0] = False
+
+
+def _pool_reload():
+    """One source-list refresh, owned by `_pool_refresh`'s background thread."""
+    try:
+        cands = _pool_pull()
+        now = time.time()
+        with _POOL_LOCK:
+            if cands:
+                keep = [u for u in _POOL[0] if _POOL_BAD.get(u, 0.0) <= now]
+                _POOL[0] = list(dict.fromkeys(POOL_MANUAL + keep + cands))[:POOL_CAND]
+            _POOL_TS[0] = now
+            _POOL_READY.set()
+        _pool_start_training(cands)
+    finally:
+        _POOL_PULLING[0] = False
+
+
 def _pool_refresh(force=False):
-    """Cheap, synchronous: pull the source list, publish it, and (once per TTL)
-    kick the background trainer. Never blocks a user request on probing."""
+    """SWR refresh for the exit list.
+
+    `force=True` remains synchronous for diagnostics/tests. Normal traffic never
+    waits for a source-list download: an existing pool is returned immediately;
+    on a cold boot we wait only `POOL_BOOT_WAIT` for the background pull, then
+    return whatever is ready. This removes the old 12-second source timeout from
+    the first Cloudflare-fallback request."""
     if not POOL_ON:
         return []
     now = time.time()
-    with _POOL_LOCK:
-        fresh = now - _POOL_TS[0] < POOL_TTL
-        if _POOL[0] and not force and fresh:
-            return list(_POOL[0])
-        if not force and fresh:
-            return []
-        _POOL_TS[0] = now
-    cands = _pool_pull()
-    if not cands:
+    if force:
+        with _POOL_LOCK:
+            if _POOL_PULLING[0]:
+                return list(_POOL[0])
+            _POOL_PULLING[0] = True
+        try:
+            cands = _pool_pull()
+            with _POOL_LOCK:
+                if cands:
+                    keep = [u for u in _POOL[0] if _POOL_BAD.get(u, 0.0) <= time.time()]
+                    _POOL[0] = list(dict.fromkeys(POOL_MANUAL + keep + cands))[:POOL_CAND]
+                _POOL_TS[0] = time.time()
+                _POOL_READY.set()
+            _pool_start_training(cands)
+        finally:
+            _POOL_PULLING[0] = False
         return list(_POOL[0])
-    with _POOL_LOCK:
-        # publish untrained right away: a racing fetch can use these immediately
-        # while the trainer learns which are fast
-        keep = [u for u in _POOL[0] if _POOL_BAD.get(u, 0.0) <= now]
-        _POOL[0] = list(dict.fromkeys(POOL_MANUAL + keep + cands))[:POOL_CAND]
-    if not _TRAINING[0]:
-        _TRAINING[0] = True
 
-        def run():
-            try:
-                _pool_train(cands)
-            finally:
-                _TRAINING[0] = False
-        threading.Thread(target=run, daemon=True, name="pooltrain").start()
-    return list(_POOL[0])
+    with _POOL_LOCK:
+        current = list(_POOL[0])
+        fresh = _POOL_TS[0] > 0 and now - _POOL_TS[0] < POOL_TTL
+        pulling = _POOL_PULLING[0]
+        if fresh:
+            return current
+        if not pulling:
+            _POOL_PULLING[0] = True
+            if not current:
+                _POOL_READY.clear()
+            start = True
+        else:
+            start = False
+    if start:
+        try:
+            threading.Thread(target=_pool_reload, daemon=True,
+                             name="poolrefresh").start()
+        except Exception:
+            _POOL_PULLING[0] = False
+    if not current:
+        _POOL_READY.wait(max(0.0, POOL_BOOT_WAIT))
+        with _POOL_LOCK:
+            current = list(_POOL[0])
+    return current
 
 
 def _pool_score(u):
@@ -716,6 +807,10 @@ def _pool_stats():
             "manual": len(POOL_MANUAL),
             "sources": len(POOL_SRCS),
             "training": bool(_TRAINING[0]),
+            "pulling": bool(_POOL_PULLING[0]),
+            "pool_try": POOL_TRY,
+            "pool_max": POOL_MAX,
+            "boot_wait_s": POOL_BOOT_WAIT,
             "direct_blocked_hosts": [h for h, t in _DIRECT_BAD.items() if t > now],
             "enabled": POOL_ON}
 
@@ -2302,6 +2397,27 @@ def _cards_from_matches(matched, years, ctype, se, ep, deadline):
     return cards
 
 
+def _source_slug_matches_title(slug, metas):
+    """A catalog-learned slug is a trusted provider-card mapping.
+
+    IMDb can return an older same-title film when the provider's page is a new
+    series (Kuheli is the measured case: source 2026 vs `tt7222514` 2016). If the
+    source page title is exact, keep the source card as a last-resort compatibility
+    path for already-installed clients that still send the old IMDb id. We do not
+    relax a fuzzy match or a different title.
+    """
+    page = parse_watch_page(SITE + "/watch/%s.html" % slug)
+    if not page:
+        return None
+    source_title = _norm_title(page.get("title") or page.get("og_title") or "")
+    if not source_title:
+        return None
+    for name, _year, _tid in metas or []:
+        if source_title == _norm_title(name):
+            return page
+    return None
+
+
 def _build_inner(ctype, imdb, se, ep, deadline):
     if imdb.startswith("bpx-"):
         # a catalog card the metadata providers never heard of: go straight to
@@ -2325,8 +2441,18 @@ def _build_inner(ctype, imdb, se, ep, deadline):
     # through to the normal search.
     hit, slug = C_SLUG.get((ctype, imdb))
     if hit and slug:
-        cards = _cards_from_matches([{"url": SITE + "/watch/%s.html" % slug}],
-                                    years, ctype, se, ep, deadline)
+        source_match = {"url": SITE + "/watch/%s.html" % slug}
+        cards = _cards_from_matches([source_match], years, ctype, se, ep, deadline)
+        if not cards:
+            # Compatibility for a stale catalog ID produced before the shelf badge
+            # fix. Exact provider title + source slug beats a false year rejection;
+            # fuzzy/collision matches still stay empty honestly.
+            page = _source_slug_matches_title(slug, metas)
+            if page:
+                cards = _cards_from_matches([{"url": page["url"]}], set(),
+                                            ctype, se, ep, deadline)
+                if cards:
+                    _STATS["slug_relaxed"] = _STATS.get("slug_relaxed", 0) + 1
         if cards:
             _mark_alts(cards)
             _STATS["cards"] += len(cards)
@@ -2421,7 +2547,20 @@ def _adopt_late_result(fut, key):
         pass                                         # cancelled / raised: ignore
 
 
+def _release_build(key, fut):
+    with _BUILD_LOCK:
+        if _BUILD_INFLIGHT.get(key) is fut:
+            _BUILD_INFLIGHT.pop(key, None)
+
+
 def build_streams(ctype, imdb, se, ep):
+    """Resolve one title/episode with positive, stale and single-flight caches.
+
+    The old cache prevented repeated work only *after* the first answer landed.
+    During a cold miss, N simultaneous Nuvio/Stremio requests each submitted a
+    full metadata → site → embed → N1/proxy chain. Now one Future owns the build;
+    followers wait on it and receive the same result, while the existing late
+    adoption still fills the cache if the answer wall expires."""
     key = (ctype, imdb, se, ep)
     hit, val = C_STREAM.get(key)
     if hit:
@@ -2436,9 +2575,29 @@ def build_streams(ctype, imdb, se, ep):
                                      args=(ctype, imdb, se, ep, key),
                                      daemon=True).start()
         return {"streams": stale[1]}
-    _STATS["resolves"] += 1
-    fut = _BUILD_EX.submit(_build_inner, ctype, imdb, se, ep, time.time() + WALL)
-    fut.add_done_callback(lambda f: _adopt_late_result(f, key))
+
+    owner = False
+    with _BUILD_LOCK:
+        fut = _BUILD_INFLIGHT.get(key)
+        if fut is None:
+            _STATS["resolves"] += 1
+            try:
+                fut = _BUILD_EX.submit(_build_inner, ctype, imdb, se, ep,
+                                       time.time() + WALL)
+            except Exception:
+                fut = None
+            if fut is not None:
+                _BUILD_INFLIGHT[key] = fut
+                owner = True
+                # Adopt first, then release the single-flight slot. Callback order
+                # matters when a tiny mocked future is already complete.
+                fut.add_done_callback(lambda f, k=key: _adopt_late_result(f, k))
+                fut.add_done_callback(lambda f, k=key: _release_build(k, f))
+        if not owner and fut is not None:
+            _STATS["build_coalesced"] = _STATS.get("build_coalesced", 0) + 1
+
+    if fut is None:
+        return {"streams": [], "message": "%s resolver is busy — retry shortly" % BRAND}
     try:
         res = fut.result(timeout=WALL)
     except Exception:
@@ -2848,8 +3007,11 @@ def _prewarm_shelf(metas, ctype):
 def catalog_prewarm():
     """Warm the three default shelves at boot so the first user does not pay for
     a 375 KB proxied fetch (and so the proxy pool gets trained early)."""
-    for ctype, cat_id in (("movie", "bpx-latest"), ("movie", "bpx-year"),
-                          ("series", "bpx-series")):
+    # Learn the reliable TV badge first. Autocomplete calls every hit "Movie",
+    # so this ordering makes a cold boot classify series search hits (Kuheli,
+    # Prem Shots, Adv. Achinta Aich) before a user taps the movie shelf.
+    for ctype, cat_id in (("series", "bpx-series"), ("movie", "bpx-latest"),
+                          ("movie", "bpx-year")):
         try:
             catalog_items(ctype, cat_id)
         except Exception:
@@ -2951,10 +3113,31 @@ def imdb_suggest_title(title, year=None, ctype="movie"):
 
 
 def _map_ids(items, ctype, budget=14.0):
-    """site cards -> Stremio ids, in bounded parallel waves (24 suggest calls at
-    once gets 429s). Unmapped items keep a routable bpx:<slug> id."""
+    """site cards -> Stremio ids, in bounded parallel waves.
+
+    A known `label-tvseries`/shelf mismatch must stay a source id. Otherwise a
+    constant autocomplete label can turn the site's 2026 *Kuheli* series into
+    IMDb's 2016 *Kuheli* movie (`tt7222514`): the title looks right, the year guard
+    quite correctly rejects the provider page, and the player shows no stream.
+    `bpx-<slug>` is safer here because it keeps the exact provider card the user
+    selected and the source resolver can play it even when IMDb/TMDB cannot map it.
+    """
     ddl = time.time() + budget
-    todo = [it for it in items if not it.get("id")]
+    todo = []
+    for it in items:
+        if it.get("id"):
+            continue
+        slug = it.get("slug") or ""
+        known = it.get("_kind_known")
+        site_series = it.get("series")
+        if known is None and slug in _SLUG_KIND:
+            known, site_series = True, _SLUG_KIND.get(slug)
+        if known and bool(site_series) != (ctype == "series"):
+            # Never manufacture a cross-type IMDb id. The provider slug is the
+            # authoritative source mapping for this card.
+            it["id"] = "bpx-" + slug
+            continue
+        todo.append(it)
     futs = {}
     for it in todo:
         if time.time() >= ddl:
@@ -2995,12 +3178,14 @@ def catalog_items(ctype, cat_id, genre=None, search=None, skip=0, cfg=None):
         for c in cands[:_PAGE_N * 2]:
             slug = urlparse(c["url"]).path.split("/watch/")[-1].replace(".html", "")
             kind = _SLUG_KIND.get(slug)      # the site's own badge, if we know it
+            kind_known = kind is not None
             if kind is None:
                 t = (c.get("type") or "").lower()
                 kind = ("series" in t) or ("tv" in t)
             it = {"slug": slug, "url": c["url"], "title": c["title"],
                   "poster": c.get("image") or "", "year": _year_of(c["title"]),
-                  "quality": "", "series": bool(kind), "rating": 0.0}
+                  "quality": "", "series": bool(kind), "rating": 0.0,
+                  "_kind_known": kind_known}
             # Rank, never filter. The autocomplete `type` says Movie for real
             # series, so a hard filter emptied the series shelf's search for every
             # query — "Prem Shots is on the site but the addon doesn't show it".
@@ -3722,6 +3907,7 @@ class Handler(BaseHTTPRequestHandler):
                 "keepalive": bool(_KEEPALIVE[0]), "keepalive_url": _KEEPALIVE[0] or None,
                 "site": SITE, "n1_hosts": list(N1_HOSTS),
                 "stats": dict(_STATS),
+                "build_inflight": len(_BUILD_INFLIGHT),
                 "blocked_hosts_s": int(_blocked_left()),
                 "proxy": _pool_stats(),
                 "catalogs": [(c["type"], c["id"]) for c in CAT_DEFS],
@@ -3988,8 +4174,9 @@ def _net_probe(only=None):
 
 
 # ══════════════════════════════════════════════════════ 16. KEEPALIVE/WATCHDOG
-_KEEPALIVE = [""]
+_KEEPALIVE = [PUBLIC_URL]
 _KEEPALIVE_LOCK = threading.Lock()
+_KEEPALIVE_SEC = max(60.0, min(600.0, float(os.environ.get("BPX_KEEPALIVE_SEC", "240"))))
 
 
 def _pool_maintain():
@@ -4017,10 +4204,11 @@ def _keepalive_loop():
                     with _KEEPALIVE_LOCK:
                         _KEEPALIVE[0] = url
                 requests.get(url.rstrip("/") + "/health", timeout=10,
-                             headers={"User-Agent": UA})
+                             headers={"User-Agent": UA, "Cache-Control": "no-cache",
+                                      "Connection": "close"})
         except Exception:
             pass
-        time.sleep(240)
+        time.sleep(_KEEPALIVE_SEC)
 
 
 def _liveness_watchdog():

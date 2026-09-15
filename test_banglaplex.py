@@ -70,6 +70,8 @@ def clear_caches():
     addon._NEG_RETRY_AT.clear()
     addon._SWR_RUNNING.clear()
     addon._WALLED.clear()
+    with addon._BUILD_LOCK:
+        addon._BUILD_INFLIGHT.clear()
     addon._SLUG_KIND.clear()
     addon._PREWARM_BUSY[0] = False      # a killed prewarm must not leak "busy"
     # NOTE: never _STATS.clear() — it is a counter dict whose keys the /health
@@ -1465,6 +1467,8 @@ def _pool_reset():
     # a real background trainer spawned by an earlier test outlives its mock and
     # benches whatever it probes, polluting later assertions
     addon._TRAINING[0] = True
+    addon._POOL_PULLING[0] = False
+    addon._POOL_READY.set()
     addon._POOL_BAD.clear()
     addon._POOL_STATS.clear()
     addon._STICKY_BUSY.clear()
@@ -1876,7 +1880,7 @@ def test_refresh_publishes_untrained_then_trains_in_background():
             started.append(self.k)
     with mock.patch.object(addon, "_pool_pull", return_value=["http://9.9.9.9:8080"]), \
          mock.patch.object(addon.threading, "Thread", FakeThread):
-        out = addon._pool_refresh()
+        out = addon._pool_refresh(force=True)
     assert out == ["http://9.9.9.9:8080"], out
     assert started and started[0].get("name") == "pooltrain", started
 
@@ -2174,8 +2178,8 @@ def test_prewarm_covers_every_default_shelf():
     with mock.patch.object(addon, "catalog_items",
                            side_effect=lambda t, c, **k: seen.append((t, c))):
         addon.catalog_prewarm()
-    assert seen == [("movie", "bpx-latest"), ("movie", "bpx-year"),
-                    ("series", "bpx-series")], seen
+    assert seen == [("series", "bpx-series"), ("movie", "bpx-latest"),
+                    ("movie", "bpx-year")], seen
 
 
 def test_main_spawns_prewarm_off_the_keepalive_thread():
@@ -3742,6 +3746,125 @@ def test_split_id_unprefixes_a_prefixed_imdb_id():
     # a real slug keeps its prefix: that is how _build_inner finds the watch page
     assert addon._split_id("series", "bpx-queens:2:3") == ("bpx-queens", 2, 3)
     assert addon._split_id("movie", "tt1234567") == ("tt1234567", None, None)
+
+
+
+def test_known_cross_type_shelf_card_keeps_the_provider_slug():
+    """Kuheli's autocomplete/IMDb path produced tt7222514 (the 2016 movie) for
+    the provider's 2026 series page. Once the listing badge has taught us the
+    real kind, a movie-shelf search must use bpx-kuheli instead of a misleading
+    IMDb id; the source card remains playable and metadata-safe."""
+    clear_caches()
+    addon._note_kind("kuheli", True)
+    item = {"slug": "kuheli", "title": "Kuheli", "year": None, "series": True}
+    with mock.patch.object(addon, "imdb_suggest_title",
+                           side_effect=AssertionError("cross-type IMDb lookup must be skipped")):
+        out = addon._map_ids([item], "movie")
+    assert out[0]["id"] == "bpx-kuheli"
+
+
+def test_catalog_search_marks_badged_cross_type_hits_as_source_ids():
+    clear_caches()
+    addon._note_kind("kuheli", True)
+    cand = {"title": "Kuheli", "type": "Movie",
+            "url": "https://banglaplex.biz/watch/kuheli.html", "image": ""}
+    with mock.patch.object(addon, "_search_autocomplete", return_value=[cand]), \
+         mock.patch.object(addon, "imdb_suggest_title",
+                           side_effect=AssertionError("the known mismatch is a source card")):
+        out = addon.catalog_items("movie", "bpx-latest", search="Kuheli")
+    assert out[0]["id"] == "bpx-kuheli" and out[0]["name"] == "Kuheli"
+
+
+def test_stale_imdb_slug_mapping_relaxes_only_an_exact_source_title():
+    """Existing clients may still send tt7222514 from the old cache. If its
+    learned provider slug says exact "Kuheli" but the years disagree, retry the
+    exact source card without the year guard; a fuzzy/collision title never gets
+    this escape hatch."""
+    clear_caches()
+    addon.C_SLUG.put(("movie", "tt7222514"), "kuheli", 600)
+    page = dict(_PAGE_FIX, slug="kuheli", title="Kuheli", year=2026,
+                url="https://banglaplex.biz/watch/kuheli.html")
+    card = _card()
+    calls = []
+
+    def cards(matched, years, *args):
+        calls.append(years)
+        return [] if len(calls) == 1 else [card]
+
+    with mock.patch.object(addon, "resolve_meta_all",
+                           return_value=[("Kuheli", 2016, None)]), \
+         mock.patch.object(addon, "_cards_from_matches", side_effect=cards), \
+         mock.patch.object(addon, "_source_slug_matches_title", return_value=page):
+        out = addon._build_inner("movie", "tt7222514", None, None, time.time() + 5)
+    assert out["streams"] == [card]
+    assert calls[0] == {2016} and calls[1] == set(), calls
+    assert addon._STATS.get("slug_relaxed", 0) >= 1
+
+
+def test_cold_pool_refresh_returns_before_a_slow_source_list():
+    """The first Cloudflare fallback must not sit behind a dead proxy-list URL;
+    an old pool can serve immediately and a cold boot waits only the tiny bootstrap
+    budget while the source pull continues in the background."""
+    clear_caches()
+    addon._POOL[0] = []
+    addon._POOL_TS[0] = 0.0
+    addon._POOL_PULLING[0] = False
+    addon._POOL_READY.clear()
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_pull():
+        started.set()
+        release.wait(3)
+        return ["http://9.9.9.9:8080"]
+
+    with mock.patch.object(addon, "_pool_pull", side_effect=slow_pull), \
+         mock.patch.object(addon, "_pool_start_training"), \
+         mock.patch.object(addon, "POOL_BOOT_WAIT", 0.05):
+        t0 = time.time()
+        out = addon._pool_refresh()
+        elapsed = time.time() - t0
+        assert out == [] and elapsed < 0.5, elapsed
+        assert started.wait(1), "refresh must have started the pull in the background"
+        release.set()
+        for _ in range(40):
+            if addon._POOL[0]:
+                break
+            time.sleep(0.02)
+    assert addon._POOL[0] == ["http://9.9.9.9:8080"]
+    addon._POOL_PULLING[0] = False
+
+
+def test_build_singleflight_shares_one_cold_resolve_with_many_users():
+    """Ten simultaneous taps for one episode must create one site/proxy chain,
+    not ten. Followers wait on the same Future and all receive the cards."""
+    clear_caches()
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+    card = {"name": "shared", "url": "https://cdn/shared.mp4"}
+
+    def slow(*args, **kwargs):
+        calls.append(1)
+        started.set()
+        release.wait(3)
+        return {"streams": [card]}
+
+    results = []
+    with mock.patch.object(addon, "_build_inner", side_effect=slow), \
+         mock.patch.object(addon, "WALL", 1.5):
+        ts = [threading.Thread(target=lambda: results.append(
+            addon.build_streams("movie", "tt-shared", None, None))) for _ in range(8)]
+        for th in ts:
+            th.start()
+        assert started.wait(1)
+        time.sleep(0.1)
+        assert addon._STATS.get("build_coalesced", 0) >= 1
+        release.set()
+        for th in ts:
+            th.join(3)
+    assert len(calls) == 1, calls
+    assert len(results) == 8 and all(r["streams"] == [card] for r in results)
 
 
 OFFLINE_TESTS = [v for k, v in sorted(globals().items())

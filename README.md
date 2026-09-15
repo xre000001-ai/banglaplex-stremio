@@ -123,26 +123,34 @@ direct egress for that host (10 min) and ride the pool **inside the same call**,
 so a user never sees the first failure. From an unblocked IP the pool is never
 even refreshed (measured: pool size stays 0).
 
-The pool is trained, not scraped-and-hoped (MovieBox pattern):
+The pool is trained, not scraped-and-hoped (MovieBox pattern), and v1.7.0 is
+biased toward many users rather than one perfect cold request:
 
-* **Sources** — proxyscrape by default (`proxy_type=http`), comma-separable for
-  more, plus `BPX_PROXY_LIST` for hand-picked exits that always ride first.
+* **Sources** — proxyscrape plus two public HTTP lists by default (override with
+  `BPX_PROXY_SOURCE`), plus `BPX_PROXY_LIST` for hand-picked exits that always ride
+  first. SOCKS remains out because it needs another dependency.
 * **Scheme filter** — socks4/5 exits are dropped: without PySocks every one of
   them raises `InvalidSchema`, so a 40/40 socks list reads as "all proxies down".
 * **Probing** — a background trainer platform-probes candidates against the
   *actually blocked* endpoint (cheap ~360 B autocomplete hit) in parallel waves,
-  publishes wave 1 immediately, then keeps the 20 fastest and **merges** them
+  publishes wave 1 immediately, then keeps the 32 fastest and **merges** them
   with already-trained members instead of replacing them.
 * **Scoring** — every exit keeps `ok/fail/EWMA-latency`; picks order by
   `quality × speed`, and a good exit stays **sticky for 90 s** (capped at 2
   in-flight) so one resolve chain rides one exit instead of re-rolling dice.
-* **Racing** — a fetch races `BPX_PROXY_TRY=5` exits concurrently and keeps the
-  first good answer, closing the losers. Free exits are mostly dead or slow;
-  walking them cost 8 s per corpse and a cold resolve never fit the 22 s wall.
+* **Racing** — a fetch races `BPX_PROXY_TRY=3` exits concurrently and keeps the
+  first good answer, closing the losers. Three is deliberate: five-way fan-out
+  multiplied sockets under concurrent users without improving the measured winner.
+  The shared HTTP adapter reuses connections.
 * **Benching** — dead exit 5 min, platform-blocked (403/503) 15 min.
-* **Never in front of a user** — the source list is pulled synchronously (fast),
-  training happens on its own thread, and `_pool_maintain()` re-trains from the
-  keepalive loop only while some host is actually benched.
+* **Never in front of a user** — a stale pool is returned immediately; a cold
+  source-list pull runs in the background and the first request waits at most
+  1.8 s for bootstrap. Training is separate, and `_pool_maintain()` re-trains
+  from the keepalive loop only while some host is actually benched.
+* **Stampede control** — one in-flight stream build is shared by every client
+  asking for the same `(type, id, season, episode)`. Eight users tapping one cold
+  episode create one metadata/site/proxy chain, not eight; `build_coalesced` is
+  visible in `/health`.
 
 Segment probes (`_range_probe`) are **never** proxied: playability must be proven
 on a normal client path, and no media byte may ride a free exit
@@ -187,7 +195,11 @@ year *and* type strictly, otherwise **`bpx-<slug>`**, a source id this addon can
 both stream and describe. A wrong `tt` would show another film's poster, which is
 worse than no mapping — measured example: *Jaatishwar* is "The Reincarnate" on
 IMDb, so it ships as `bpx-jaatishwar`. Roughly ⅛ of a shelf ends up source-only
-and still plays.
+and still plays. A known shelf-type mismatch is also forced to `bpx-<slug>`:
+this prevents a 2026 provider series such as **Kuheli** from becoming IMDb's
+same-title 2016 movie `tt7222514`, whose year guard would correctly reject the
+provider page and look like "no stream". Old cached IMDb ids get an exact-title
+source-slug compatibility retry; fuzzy collisions do not.
 
 ### Metadata: providers first, **source fallback** second
 
@@ -342,9 +354,12 @@ free plan, Singapore region, `pip install -r requirements.txt`,
 
 After the first deploy, set `BPX_PUBLIC_URL=https://<service>.onrender.com` so the
 keepalive self-ping has an address immediately (it also learns the URL from the
-first request's `Host` header, so this is optional). Render's free tier sleeps
-after ~15 idle minutes; the keepalive thread pings `/health` every 240 s to stop
-that, and a liveness watchdog restarts the process if `/health` fails 3×.
+first request's `Host` header, so this is optional). The process pings `/health`
+every 240 s while it is running and a liveness watchdog restarts it if local
+`/health` fails 3×. **Render Free still officially spins a service down after 15
+minutes without inbound traffic**; an in-process ping cannot wake a process that
+has already been stopped. For genuinely always-on behaviour, use a paid Render
+instance or an external monitor (for example, a 5–10 minute health check).
 
 ### Environment
 
@@ -361,10 +376,10 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 | `BPX_ABYSS` | `1` | `0` = kill switch for the abyssplayer path |
 | `BPX_BROWSER_CARD` | `1` | `0` = never offer the `/player/` iframe card (per-install: `bc`) |
 | `BPX_PROXY` | `auto` | `0` = never use the free proxy pool |
-| `BPX_PROXY_SOURCE` | proxyscrape | free HTTP proxy list URL(s), comma-separated |
+| `BPX_PROXY_SOURCE` | 3 HTTP lists | free HTTP proxy list URL(s), comma-separated |
 | `BPX_PROXY_LIST` | *(none)* | hand-picked exits (`http://user:pass@host:port,…`) — always ride first |
-| `BPX_PROXY_TRY` | `5` | exits raced concurrently per fetch |
-| `BPX_POOL_MAX` | `20` | trained exits kept |
+| `BPX_PROXY_TRY` | `3` | exits raced concurrently per fetch |
+| `BPX_POOL_MAX` | `32` | trained exits kept |
 | `BPX_PREWARM` | `1` | `0` = do not warm the catalog shelves at boot |
 | `BPX_PREWARM_STREAMS` | `6` | cards warmed per served shelf page, `0` = off |
 | `BPX_DEBUG_KEY` | `bpx-dbg-4c9e` | `/debug/*` key — **change this in prod** |
@@ -375,7 +390,7 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 ## Tests
 
 ```bash
-python3 test_banglaplex.py           # 266 offline tests, every network call mocked
+python3 test_banglaplex.py           # 271 offline tests, every network call mocked
 BPX_LIVE=1 python3 test_banglaplex.py # + 4 live integration tests (real site/CDN)
 ```
 
