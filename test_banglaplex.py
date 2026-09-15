@@ -2533,6 +2533,25 @@ def test_prewarm_shelf_survives_a_build_error():
     assert addon._PREWARM_BUSY[0] is False
 
 
+def test_prewarm_shelf_survives_a_submit_failure():
+    """an executor that refuses work (shutting down at exit) must not kill the
+    thread or strand the busy flag, which would disable prewarming for good."""
+    clear_caches()
+    addon._PREWARM_BUSY[0] = False
+
+    class FakeThread:
+        def __init__(self, target=None, daemon=None, name=None):
+            self.fn = target
+
+        def start(self):
+            self.fn()
+    with mock.patch.object(addon.threading, "Thread", FakeThread), \
+         mock.patch.object(addon._BUILD_EX, "submit",
+                           side_effect=RuntimeError("cannot schedule")):
+        addon._prewarm_shelf([{"id": "tt1"}, {"id": "tt2"}], "movie")
+    assert addon._PREWARM_BUSY[0] is False, "the busy flag must be released"
+
+
 def test_http_catalog_prewarms_only_the_first_plain_page():
     clear_caches()
     addon._PREWARM_BUSY[0] = False

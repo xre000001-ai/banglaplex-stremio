@@ -50,7 +50,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.3.0"
+VERSION    = "1.3.1"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -2296,15 +2296,26 @@ def _prewarm_shelf(metas, ctype):
     _PREWARM_BUSY[0] = True
 
     def run():
+        # Everything is optional work: a prewarm must never be able to kill its
+        # thread (and never leave the busy flag stuck, which would switch shelf
+        # prewarming off for the life of the process). submit() itself can raise
+        # — an executor that is already shut down at exit, for instance.
         try:
             for i in range(0, len(todo), 2):
-                futs = [_BUILD_EX.submit(build_streams, ctype, mid, None, None)
-                        for mid in todo[i:i + 2]]
+                futs = []
+                for mid in todo[i:i + 2]:
+                    try:
+                        futs.append(_BUILD_EX.submit(build_streams, ctype, mid,
+                                                     None, None))
+                    except Exception:
+                        pass
                 for f in futs:
                     try:
                         f.result(timeout=WALL + 15)
                     except Exception:
                         pass
+        except Exception:
+            pass
         finally:
             _PREWARM_BUSY[0] = False
     threading.Thread(target=run, daemon=True, name="shelfwarm").start()
