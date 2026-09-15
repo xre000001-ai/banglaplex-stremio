@@ -304,7 +304,7 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 ## Tests
 
 ```bash
-python3 test_banglaplex.py           # 246 offline tests, every network call mocked
+python3 test_banglaplex.py           # 248 offline tests, every network call mocked
 BPX_LIVE=1 python3 test_banglaplex.py # + 4 live integration tests (real site/CDN)
 ```
 
@@ -336,7 +336,17 @@ rate-limit budget, so don't loop it.
 > shelf prewarm, pool trainer) are plain `threading.Thread`s that outlive the test
 > which spawned them and land in whatever mock is installed next; the pool
 > diagnostics pin `_pool_order` and answer per-exit rather than per-call-order
-> because of it.
+> because of it. A racer benches its exit from *its own* thread while `_pool_get`
+> returns the instant another exit answers, so `_POOL_BAD` is polled, never read
+> immediately.
+>
+> **Cumulative counters are snapshotted, never zeroed.** `_STATS` backs `/health`
+> (`late_adopts`, `walls`, `abyss_ok`, `relay_bytes`…) and lives for the process,
+> so a test asserts on the *delta*. `late_adopts` itself was lying: `set_result()`
+> notifies the waiter and then runs done-callbacks, so the adopt callback usually
+> beat `fut.result()` returning on a perfectly normal resolve and counted it —
+> prod showed `late_adopts == resolves` (11/11) with zero actual walls. It now
+> counts only keys that really gave up at the wall.
 
 ---
 

@@ -51,7 +51,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.4.0"
+VERSION    = "1.4.1"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -2321,6 +2321,9 @@ def _neg_bg_retry(ckey, fn):
     threading.Thread(target=fn, daemon=True).start()
 
 
+_WALLED = set()      # keys whose request gave up at the wall (see _adopt_late_result)
+
+
 def _adopt_late_result(fut, key):
     """A build that outlives the answer wall must still pay off.
 
@@ -2339,7 +2342,14 @@ def _adopt_late_result(fut, key):
             return                                   # a newer answer already won
         C_STREAM.put(key, cards, _STREAM_TTL)
         C_STALE[key] = (time.time() + _STREAM_STALE, cards)
-        _STATS["late_adopts"] = _STATS.get("late_adopts", 0) + 1
+        # Only count it when the player was actually told to retry. set_result()
+        # notifies the waiter and then runs the callbacks, so on a normal resolve
+        # this callback routinely wins the race against `fut.result()` returning —
+        # counting that made late_adopts equal resolves on prod and hid the real
+        # signal (how many requests blew the wall).
+        if key in _WALLED:
+            _WALLED.discard(key)
+            _STATS["late_adopts"] = _STATS.get("late_adopts", 0) + 1
     except Exception:
         pass                                         # cancelled / raised: ignore
 
@@ -2370,6 +2380,9 @@ def build_streams(ctype, imdb, se, ep):
         # build still running in background: it will fill the cache; ask for a
         # retry instead of lying with an empty list.
         _STATS["walls"] = _STATS.get("walls", 0) + 1
+        if len(_WALLED) > 400:
+            _WALLED.clear()                          # a build that never lands
+        _WALLED.add(key)
         _log({"t": int(time.time()), "id": imdb, "se": se, "ep": ep,
               "wall": True, "ms": int(WALL * 1000)})
         return {"streams": [],

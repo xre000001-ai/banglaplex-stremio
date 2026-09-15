@@ -69,6 +69,7 @@ def clear_caches():
     addon.C_STALE.clear()
     addon._NEG_RETRY_AT.clear()
     addon._SWR_RUNNING.clear()
+    addon._WALLED.clear()
     addon._PREWARM_BUSY[0] = False      # a killed prewarm must not leak "busy"
     # NOTE: never _STATS.clear() — it is a counter dict whose keys the /health
     # surface and the tests read directly; emptying it raises KeyError.
@@ -1563,8 +1564,14 @@ def test_fetch_walks_exits_until_one_works():
         # _pool_order is pinned because a trainer thread left over from an earlier
         # test can republish the pool mid-flight and empty it under us
         r, via = addon._fetch("https://banglaplex.biz/x")
-    assert via is True and r.status_code == 200
-    assert len(addon._POOL_BAD) >= 1
+    assert via is True and r.status_code == 200, (via, r)
+    for _ in range(40):
+        # the 403 exit is benched by its OWN racer thread, and _pool_get returns
+        # the moment 3.3.3.3 answers — so this is a poll, never an immediate read
+        if addon._POOL_BAD:
+            break
+        time.sleep(0.05)
+    assert len(addon._POOL_BAD) >= 1, "the flagged exit must be benched"
 
 
 def test_fetch_all_exits_dead_is_transient_none():
@@ -3427,6 +3434,56 @@ def live_health_over_http():
 
 LIVE_TESTS = [live_resolve_movie, live_resolve_series_season_pack,
               live_card_actually_plays, live_honest_empty_for_dead_player]
+
+def test_late_adopts_counts_only_requests_that_blew_the_wall():
+    """Future.set_result() notifies the waiter and THEN runs the done-callbacks, so
+    on a perfectly normal resolve the adopt callback routinely beats
+    `fut.result()` returning and sees an empty cache. Counting that made
+    `late_adopts` equal `resolves` on prod (11/11) and buried the one number that
+    matters — how many players were told to tap again."""
+    clear_caches()
+    # both counters are cumulative across the whole suite — snapshot, never zero
+    before = addon._STATS.get("late_adopts", 0)
+    walls0 = addon._STATS.get("walls", 0)
+    card = {"name": "quick", "url": "https://cdn/master.m3u8"}
+    with mock.patch.object(addon, "_build_inner", return_value={"streams": [card]}):
+        out = addon.build_streams("series", "bpx-quick", 1, 1)
+    assert out["streams"] == [card], out
+    for _ in range(40):                              # let the callback run
+        time.sleep(0.05)
+        if addon._STATS.get("late_adopts", 0) != before:
+            break
+    assert addon._STATS.get("late_adopts", 0) == before, \
+        "a served-in-time resolve is not a late adopt"
+    assert addon._STATS.get("walls", 0) == walls0, "this resolve never hit the wall"
+    assert not addon._WALLED, addon._WALLED
+
+
+def test_a_build_that_outlives_the_wall_is_adopted_and_counted():
+    clear_caches()
+    before = addon._STATS.get("late_adopts", 0)
+    card = {"name": "slow", "url": "https://cdn/master.m3u8"}
+    release = threading.Event()
+
+    def slow(*a, **k):
+        release.wait(15)
+        return {"streams": [card]}
+
+    key = ("series", "bpx-slow", 1, 1)
+    with mock.patch.object(addon, "_build_inner", side_effect=slow), \
+         mock.patch.object(addon, "WALL", 0.4):
+        out = addon.build_streams("series", "bpx-slow", 1, 1)
+    assert out["streams"] == [] and "still resolving" in out.get("message", "")
+    assert addon._STATS.get("walls", 0) >= 1 and key in addon._WALLED
+    release.set()
+    for _ in range(200):                             # the worker caches it itself
+        if addon.C_STREAM.get(key)[0]:
+            break
+        time.sleep(0.05)
+    assert addon.C_STREAM.get(key)[1] == [card], "the late answer must be cached"
+    assert addon._STATS.get("late_adopts", 0) == before + 1
+    assert key not in addon._WALLED, "an adopted key must not linger in _WALLED"
+
 
 def test_split_id_unprefixes_a_prefixed_imdb_id():
     """`bpx-tt1234` is legal (the manifest lists both prefixes) but it is an IMDb
