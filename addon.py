@@ -50,7 +50,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.2.1"
+VERSION    = "1.2.2"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -2146,6 +2146,12 @@ def apply_cfg(cards, cfg=None):
 
 # ── site listing parse ───────────────────────────────────────────────────────
 _CARD_SPLIT = 'class="col-md-2 col-sm-3 col-xs-6"'
+# the card container's column class VARIES by page (homepage/genre use col-xs-6,
+# /year/ uses col-xs-4), so the poster div is the only anchor present in every
+# layout — splitting on a column class silently returned 0 cards for a whole
+# shelf (measured on prod: /year/2026.html, 24 cards in the HTML, 0 parsed)
+_POSTER_RE = re.compile(
+    r"""latest-movie-img-container lazy"\s*style="background-image:\s*url\('([^']*)'\)""")
 _LIST_TTL = 45 * 60
 _IMDB_TTL = 24 * 3600
 _META_RES_TTL = 12 * 3600
@@ -2159,7 +2165,15 @@ def parse_listing(h):
     sturdier than one big multi-line pattern: the grid mixes trending badges,
     lazy background-images and TV labels in varying order."""
     out, seen = [], set()
-    for chunk in (h or "").split(_CARD_SPLIT)[1:]:
+    h = h or ""
+    marks = list(_POSTER_RE.finditer(h))
+    chunks = []
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else min(len(h), m.end() + 6000)
+        chunks.append((m.group(1), h[m.start():end]))
+    if not chunks:                       # layout without lazy posters: old split
+        chunks = [("", c) for c in h.split(_CARD_SPLIT)[1:]]
+    for poster, chunk in chunks:
         m = re.search(r"/watch/([a-z0-9\-_.]+?)\.html", chunk)
         if not m:
             continue
@@ -2180,7 +2194,7 @@ def parse_listing(h):
             "slug": slug,
             "url": SITE + "/watch/" + slug + ".html",
             "title": title,
-            "poster": _html.unescape(pm.group(1)).strip() if pm else "",
+            "poster": _html.unescape(poster or (pm.group(1) if pm else "")).strip(),
             "year": int(ym.group(1)) if ym else None,
             "quality": _html.unescape(qm.group(1)).strip() if qm else "",
             "series": "label-tvseries" in chunk,

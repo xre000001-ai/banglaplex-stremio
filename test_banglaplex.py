@@ -1838,6 +1838,34 @@ def test_parse_listing_reads_every_card_field():
     assert items[1]["trending"] is False
 
 
+def test_parse_listing_handles_every_column_layout():
+    """the card column class VARIES by page: homepage/genre use col-xs-6, /year/
+    uses col-xs-4. Splitting on a column class parsed 0 of 24 real cards and
+    blanked a whole shelf (measured on prod)."""
+    xs6 = _listing(2)
+    assert len(addon.parse_listing(xs6)) == 2
+    xs4 = xs6.replace("col-md-2 col-sm-3 col-xs-6", "col-md-2 col-sm-3 col-xs-4")
+    got = addon.parse_listing(xs4)
+    assert len(got) == 2, "the col-xs-4 layout must parse too"
+    assert got[0]["poster"].endswith("100.jpg") and got[0]["title"] == "Title 0"
+    assert got[0]["year"] == 2026 and got[0]["quality"] == "HDTC"
+
+
+def test_parse_listing_needs_no_column_class_at_all():
+    """only the poster div is required — everything else is read from the card
+    body that follows it."""
+    h = ("""<div class="whatever"><div class="latest-movie-img-container lazy"
+    style="background-image: url('https://banglaplex.biz/uploads/video_thumb/7.jpg');">
+    <a href="https://banglaplex.biz/watch/only-poster.html" class="ico-play"></a>
+    <span class="label label-primary"> WEB-DL </span>
+    <span class="label label-year"> 2025 </span>
+    <div class="movie-title"><h3><a href="#">Only Poster</a></h3></div></div>""")
+    got = addon.parse_listing(h)
+    assert len(got) == 1 and got[0]["slug"] == "only-poster"
+    assert got[0]["poster"].endswith("7.jpg") and got[0]["year"] == 2025
+    assert got[0]["quality"] == "WEB-DL" and got[0]["title"] == "Only Poster"
+
+
 def test_parse_listing_detects_series_and_dedupes():
     h = _listing(2, series=True) + _listing(2, series=True)     # same cards twice
     items = addon.parse_listing(h)
