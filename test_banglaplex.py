@@ -63,7 +63,8 @@ def run(test):
 def clear_caches():
     for c in (addon.C_SEARCH, addon.C_PAGE, addon.C_META, addon.C_EMBED,
               addon.C_N1, addon.C_STREAM, addon.C_LIST, addon.C_IMDB,
-              addon.C_METARES, addon.C_SLUG, addon.C_ABYSS):
+              addon.C_METARES, addon.C_SLUG, addon.C_ABYSS,
+              addon.C_ABYSS_ONLY):
         c.clear()
         c.bytes = 0
     addon.C_STALE.clear()
@@ -73,6 +74,7 @@ def clear_caches():
     with addon._BUILD_LOCK:
         addon._BUILD_INFLIGHT.clear()
     addon._SLUG_KIND.clear()
+    addon._N1_RESOLVE_STATE.clear()
     addon._PREWARM_BUSY[0] = False      # a killed prewarm must not leak "busy"
     # NOTE: never _STATS.clear() — it is a counter dict whose keys the /health
     # surface and the tests read directly; emptying it raises KeyError.
@@ -3052,6 +3054,39 @@ def test_resolve_abyss_kill_switch_and_bad_page():
     with mock.patch.object(addon, "_get", return_value=R()):
         assert addon.resolve_abyss("https://abyssplayer.com/x", {}, "", "movie",
                                    None, None, time.time() + 5) == []
+
+
+
+def test_resolve_file_reuses_a_confirmed_abyss_only_route():
+    clear_caches()
+    page = {"url": "https://banglaplex.biz/watch/queens.html", "title": "Queens",
+            "year": 2026, "slug": "queens", "keys": [("k", True, "Full")],
+            "iframe": "https://plextream.work/embed.php?id=V2aAlO9K"}
+    servers = [("Server 3", "https://abyssplayer.com/eLY0XBgBP"),
+               ("Server 2", "https://bpx.strp2p.site/#dead1"),
+               ("Server 1", "https://bpx.rpmvid.site/#dead2")]
+    addon.C_ABYSS_ONLY.put("queens", True, 600)
+    with mock.patch.object(addon, "parse_watch_page", return_value=page), \
+         mock.patch.object(addon, "parse_embed_servers", return_value=servers), \
+         mock.patch.object(addon, "resolve_n1",
+                           side_effect=AssertionError("confirmed Abyss-only title must skip 3n1")), \
+         mock.patch.object(addon, "resolve_abyss", return_value=[{"_cdn": "abyss"}]) as ra:
+        out = addon._resolve_file(page, "k", "Full", "", "series", 1, 1,
+                                  time.time() + 5)
+    assert out == [{"_cdn": "abyss"}] and ra.called
+    assert addon._STATS.get("abyss_only_hits", 0) >= 1
+
+
+def test_resolve_n1_marks_only_all_definitive_404s_as_dead():
+    clear_caches()
+    servers = [("s", "https://bpx.strp2p.site/#dead1"),
+               ("s", "https://bpx.rpmvid.site/#dead2")]
+    with mock.patch.object(addon, "n1_video", return_value=False):
+        assert addon.resolve_n1(servers) == (None, None, None)
+    assert addon._N1_RESOLVE_STATE[addon._n1_candidate_key(servers)] == "dead"
+    with mock.patch.object(addon, "n1_video", side_effect=[False, None]):
+        addon.resolve_n1(servers)
+    assert addon._N1_RESOLVE_STATE[addon._n1_candidate_key(servers)] == "transient"
 
 
 def test_resolve_file_falls_back_to_abyss_when_3n1_is_dead():

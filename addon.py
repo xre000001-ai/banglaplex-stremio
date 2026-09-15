@@ -51,7 +51,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.7.2"
+VERSION    = "1.7.3"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -194,6 +194,7 @@ C_IMDB    = TTLCache(2 * 1024 * 1024, "imdbmap")
 C_METARES = TTLCache(6 * 1024 * 1024, "metares")
 C_SLUG    = TTLCache(1 * 1024 * 1024, "slugmap")
 C_ABYSS   = TTLCache(4 * 1024 * 1024, "abyss")
+C_ABYSS_ONLY = TTLCache(1 * 1024 * 1024, "abyss-only")  # confirmed dead 3n1 route
 C_STALE   = {}                                    # key -> (expiry, cards)
 _NEG_RETRY_AT = {}
 _SWR_RUNNING = set()
@@ -230,7 +231,7 @@ _REQLOG = []
 _REQLOG_LOCK = threading.Lock()
 _STATS = {"started": time.time(), "resolves": 0, "cards": 0, "empties": 0,
           "n1_calls": 0, "n1_429": 0, "relay_bytes": 0, "slug_hits": 0,
-          "build_coalesced": 0}
+          "build_coalesced": 0, "abyss_only_hits": 0}
 
 
 def _log(entry):
@@ -1521,6 +1522,7 @@ def parse_embed_servers(iframe_url):
 _N1_LOCKS = {h: threading.Lock() for h in N1_HOSTS}
 _N1_LAST = {h: 0.0 for h in N1_HOSTS}
 _N1_BUSY = {h: 0.0 for h in N1_HOSTS}
+_N1_RESOLVE_STATE = {}  # candidate tuple -> ok/dead/transient; never an empty cache
 
 
 def _n1_throttle(host):
@@ -1579,17 +1581,33 @@ def n1_video(host, vid, deadline=None, retries=1):
 _N1_ID_RE = re.compile(r"https?://([^/]+)/#([A-Za-z0-9_\-]{4,16})")
 
 
+def _n1_candidate_key(servers):
+    return tuple((m.group(1), m.group(2)) for _lbl, u in servers
+                 for m in [_N1_ID_RE.match(u or "")] if m and m.group(1) in N1_HOSTS)
+
+
 def resolve_n1(servers, deadline=None):
-    """server list -> (payload, host, vid) for the first frontend that answers."""
-    cands = []
-    for _lbl, u in servers:
-        m = _N1_ID_RE.match(u or "")
-        if m and m.group(1) in N1_HOSTS:
-            cands.append((m.group(1), m.group(2)))
+    """server list -> (payload, host, vid) for the first frontend that answers.
+
+    Besides the public result, remember whether an all-frontend miss was a real
+    404 or a transient timeout/429. Only the former may create the short Abyss-only
+    fast path; transient failures must remain retryable (house rule: never cache a
+    transient as a negative).
+    """
+    cands = list(_n1_candidate_key(servers))
+    state_key = tuple(cands)
+    saw_transient = False
+    saw_dead = False
     for host, vid in cands:
         p = n1_video(host, vid, deadline=deadline)
         if isinstance(p, dict):
+            _N1_RESOLVE_STATE[state_key] = "ok"
             return p, host, vid
+        if p is False:
+            saw_dead = True
+        else:
+            saw_transient = True
+    _N1_RESOLVE_STATE[state_key] = "dead" if saw_dead and not saw_transient else "transient"
     return None, None, None
 
 
@@ -2329,8 +2347,18 @@ def _resolve_file(page, key, label, note, ctype, se, ep, deadline):
         return resolve_abyss(abyss_url, pg, note, ctype, se, ep, deadline) \
             if abyss_url else []
 
+    only_key = pg.get("slug") or iframe
+    hit_only, _ = C_ABYSS_ONLY.get(only_key)
+    if hit_only:
+        _STATS["abyss_only_hits"] = _STATS.get("abyss_only_hits", 0) + 1
+        return _via_abyss()
     payload, n1host, vid = resolve_n1(servers, deadline=deadline)
     if not payload:
+        if _N1_RESOLVE_STATE.get(_n1_candidate_key(servers)) == "dead":
+            # The 3n1 candidates all answered definitive 404/not-found. Keep the
+            # title hot on its verified Abyss path for 30 minutes; a timeout or
+            # 429 records "transient" and never reaches this cache.
+            C_ABYSS_ONLY.put(only_key, True, 30 * 60)
         return _via_abyss()
     subs = collect_subtitles(payload, n1host)
     pg = dict(pg)

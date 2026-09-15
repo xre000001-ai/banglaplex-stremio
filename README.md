@@ -151,6 +151,10 @@ biased toward many users rather than one perfect cold request:
   asking for the same `(type, id, season, episode)`. Eight users tapping one cold
   episode create one metadata/site/proxy chain, not eight; `build_coalesced` is
   visible in `/health`.
+* **Abyss-only fast lane** — once both 3n1 candidates have returned definitive
+  404/not-found for a provider slug, that is remembered for 30 minutes (never for
+  a timeout/429). Later episodes go straight to the already-verified Abyss path,
+  avoiding repeated dead API calls and reducing 3n1 rate-limit pressure.
 
 Segment probes (`_range_probe`) are **never** proxied: playability must be proven
 on a normal client path, and no media byte may ride a free exit
@@ -394,7 +398,7 @@ instance or an external monitor (for example, a 5–10 minute health check).
 ## Tests
 
 ```bash
-python3 test_banglaplex.py           # 273 offline tests, every network call mocked
+python3 test_banglaplex.py           # 275 offline tests, every network call mocked
 BPX_LIVE=1 python3 test_banglaplex.py # + 4 live integration tests (real site/CDN)
 ```
 
