@@ -50,7 +50,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.2.2"
+VERSION    = "1.3.0"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -190,6 +190,7 @@ C_STREAM  = TTLCache(12 * 1024 * 1024, "streams")
 C_LIST    = TTLCache(8 * 1024 * 1024, "listings")
 C_IMDB    = TTLCache(2 * 1024 * 1024, "imdbmap")
 C_METARES = TTLCache(6 * 1024 * 1024, "metares")
+C_SLUG    = TTLCache(1 * 1024 * 1024, "slugmap")
 C_STALE   = {}                                    # key -> (expiry, cards)
 _NEG_RETRY_AT = {}
 _SWR_RUNNING = set()
@@ -207,7 +208,7 @@ _S.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
 _REQLOG = []
 _REQLOG_LOCK = threading.Lock()
 _STATS = {"started": time.time(), "resolves": 0, "cards": 0, "empties": 0,
-          "n1_calls": 0, "n1_429": 0, "relay_bytes": 0}
+          "n1_calls": 0, "n1_429": 0, "relay_bytes": 0, "slug_hits": 0}
 
 
 def _log(entry):
@@ -476,7 +477,7 @@ POOL_CAND = 90             # candidates pulled from the sources per refresh
 POOL_TRY  = int(os.environ.get("BPX_PROXY_TRY", "5"))   # exits raced per fetch
 POOL_TO   = 8.0            # per-exit connect/read timeout (free proxies are slow)
 PROBE_TO  = 6.0            # training probe timeout
-PROBE_WAVE = 24            # wave size: publish as soon as wave 1 lands
+PROBE_WAVE = 45            # wave size: publish as soon as wave 1 lands
 DIRECT_BLOCK_TTL = 600.0   # host benched for direct egress after a 403/503
 
 _HOST_BLOCK = {}
@@ -1885,6 +1886,20 @@ def _build_inner(ctype, imdb, se, ep, deadline):
     if not metas:
         return {"streams": [], "message": "no metadata for this id"}
     years = {int(y) for _n, y, _t in metas if y}
+    # fast path: a catalog build already learned which site slug this id is, so
+    # the autocomplete hop (a proxied fetch on a flagged egress) can be skipped.
+    # The year guard inside _cards_from_matches still applies, and a miss falls
+    # through to the normal search.
+    hit, slug = C_SLUG.get((ctype, imdb))
+    if hit and slug:
+        cards = _cards_from_matches([{"url": SITE + "/watch/%s.html" % slug}],
+                                    years, ctype, se, ep, deadline)
+        if cards:
+            for i in range(1, len(cards)):
+                cards[i]["name"] += " · alt"
+            _STATS["cards"] += len(cards)
+            _STATS["slug_hits"] = _STATS.get("slug_hits", 0) + 1
+            return {"streams": cards[:MAX_CARDS]}
     searched = matched_any = transient = False
     for name, year, _tid in metas:
         if time.time() >= deadline:
@@ -2258,6 +2273,43 @@ def list_page(url, timeout=18):
     return []
 
 
+_PREWARM_BUSY = [False]
+PREWARM_N = int(os.environ.get("BPX_PREWARM_STREAMS", "6"))
+
+
+def _prewarm_shelf(metas, ctype):
+    """Warm the streams for the first few cards of a shelf the user just opened,
+    so tapping one answers from cache instead of paying 3-10 s. Bounded: two at
+    a time, first page only, never for something already cached."""
+    if PREWARM_N <= 0 or _PREWARM_BUSY[0]:
+        return
+    todo = []
+    for m in metas[:PREWARM_N]:
+        mid = m.get("id") or ""
+        if not (mid.startswith("tt") or mid.startswith("bpx-")):
+            continue
+        if C_STREAM.get((ctype, mid, None, None))[0]:
+            continue
+        todo.append(mid)
+    if not todo:
+        return
+    _PREWARM_BUSY[0] = True
+
+    def run():
+        try:
+            for i in range(0, len(todo), 2):
+                futs = [_BUILD_EX.submit(build_streams, ctype, mid, None, None)
+                        for mid in todo[i:i + 2]]
+                for f in futs:
+                    try:
+                        f.result(timeout=WALL + 15)
+                    except Exception:
+                        pass
+        finally:
+            _PREWARM_BUSY[0] = False
+    threading.Thread(target=run, daemon=True, name="shelfwarm").start()
+
+
 def catalog_prewarm():
     """Warm the three default shelves at boot so the first user does not pay for
     a 375 KB proxied fetch (and so the proxy pool gets trained early)."""
@@ -2380,6 +2432,10 @@ def _map_ids(items, ctype, budget=14.0):
         except Exception:
             tt = None
         it["id"] = tt or ("bpx-" + it["slug"])
+        if tt:
+            # remember the site slug for this id: a later /stream can skip the
+            # autocomplete hop entirely (one less proxied fetch ≈ 2 s on Render)
+            C_SLUG.put((ctype, tt), it["slug"], _IMDB_TTL)
     for it in items:
         if not it.get("id"):
             it["id"] = "bpx-" + it["slug"]
@@ -2555,6 +2611,39 @@ def _needs_site(meta):
     return not (meta.get("poster") and meta.get("description"))
 
 
+def _needs_provider(meta):
+    """True when the SOURCE left a hole a provider can fill. The fallback has to
+    run both ways: brand-new Bangla series often have a fuller page on
+    TMDB/Cinemeta (cast, runtime, rating) than on the site itself."""
+    if not meta:
+        return False
+    return not (meta.get("cast") and meta.get("genres") and meta.get("description"))
+
+
+def _provider_meta(ctype, imdb, cfg=None):
+    """Cinemeta ∥ TMDB -> one merged dict (None when neither knows the id)."""
+    cfg = cfg or get_cfg()
+    meta = None
+    futs = [_IO_EX.submit(_cinemeta_full, ctype, imdb)]
+    key = cfg.get("tmdb") or TMDB_KEY
+    if key:
+        futs.append(_IO_EX.submit(_tmdb_full, ctype, imdb, key))
+    for f in as_completed(futs, timeout=10):
+        try:
+            got = f.result(timeout=0)
+        except Exception:
+            got = None
+        if not got:
+            continue
+        if meta is None:
+            meta = dict(got)
+        else:
+            meta = _merge_meta(meta, got)
+        if not _needs_site(meta):
+            break
+    return meta
+
+
 def _site_meta_for(ctype, title, year=None, slug=None):
     """source-side meta by slug, or by a site search when we only have a title."""
     if slug:
@@ -2577,34 +2666,39 @@ def build_meta(ctype, mid, cfg=None):
         return val
     meta = None
     if mid.startswith("tt"):
-        futs = [_IO_EX.submit(_cinemeta_full, ctype, mid)]
-        key = cfg.get("tmdb") or TMDB_KEY
-        if key:
-            futs.append(_IO_EX.submit(_tmdb_full, ctype, mid, key))
-        for f in as_completed(futs, timeout=10):
-            try:
-                got = f.result(timeout=0)
-            except Exception:
-                got = None
-            if got and (meta is None or (not meta.get("poster") and got.get("poster"))):
-                base = dict(got)
-                if meta:
-                    for k, v in meta.items():
-                        if v and not base.get(k):
-                            base[k] = v
-                meta = base
-            if meta and not _needs_site(meta):
-                break
+        meta = _provider_meta(ctype, mid, cfg)
         if _needs_site(meta):
-            site = _site_meta_for(ctype, (meta or {}).get("name") or "",
-                                  _year_of((meta or {}).get("releaseInfo") or
-                                           str((meta or {}).get("year") or "")))
+            name = (meta or {}).get("name") or ""
+            year = _year_of((meta or {}).get("releaseInfo") or
+                            str((meta or {}).get("year") or ""))
+            if not name:
+                # brand-new title: no provider knows the id at all, so there is
+                # nothing to search the site with yet. Resolve the NAME from the
+                # id (IMDb-suggest-by-id is part of the consensus) and then fall
+                # back to the source — measured on prod: /meta/series/tt43695931
+                # answered {} while the site had a full page for it.
+                for nm, yr, _t in (resolve_meta_all(ctype, mid) or []):
+                    if nm:
+                        name, year = nm, (year or yr)
+                        break
+            site = _site_meta_for(ctype, name, year)
             if site:
                 meta = _merge_meta(meta, site)
+                meta.setdefault("name", site.get("name"))
         if meta:
             meta["id"], meta["type"] = mid, ctype
     elif mid.startswith("bpx-"):
         meta = _site_meta_for(ctype, "", slug=mid[4:])
+        if _needs_provider(meta):
+            # reverse direction: the source id may still be a known title under a
+            # slightly different name — strict suggest, so a wrong match is
+            # impossible by construction
+            tt = imdb_suggest_title(meta.get("name") or "", meta.get("year"), ctype)
+            if tt:
+                prov = _provider_meta(ctype, tt, cfg)
+                if prov:
+                    meta = _merge_meta(meta, prov)
+                    meta["imdb_id"] = tt
     if meta:
         meta = normalize_meta(meta)
         C_METARES.put(ck, meta, _META_RES_TTL)
@@ -3061,6 +3155,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 skip = 0
             metas = catalog_items(ctype, cid, genre, search, skip, cfg)
+            if metas and not search and not skip:
+                _prewarm_shelf(metas, ctype)
             _log({"t": int(time.time()), "path": path, "cat": cid,
                   "genre": genre, "search": (search or "")[:30], "skip": skip,
                   "metas": len(metas), "ms": int((time.time() - t0) * 1000)})

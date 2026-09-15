@@ -118,17 +118,40 @@ and still plays.
 ### Metadata: providers first, **source fallback** second
 
 `/meta/{type}/{id}.json` races Cinemeta + TMDB (the install's own key if given,
-else the built-in one). If the providers leave a visible hole — no poster or no
-synopsis — the watch page is scraped and fills exactly those fields
-(`og:*`, plus the Director / Writer / Actor / Country / Release / Duration /
-Quality / Genre rows). For `bpx-<slug>` ids the source is the *only* provider, so
-regional titles IMDb/TMDB never heard of still get a full detail page. Every
-shape is normalised before it ships: Cinemeta sends `director` as a list and no
-`year` (only `releaseInfo`), the site sends comma strings.
+else the built-in one) and scrapes the watch page (`og:*`, plus the Director /
+Writer / Actor / Country / Release / Duration / Quality / Genre rows). **The
+fallback runs both ways**, whichever side has the hole:
+
+* providers answered but left a hole → the source fills it;
+* providers answered *nothing* (a brand-new regional title) → the id is resolved
+  to a name via IMDb's suggest-by-id endpoint, and that name is used to find the
+  watch page — without a name there is nothing to search the site with, which is
+  how `tt…` ids used to ship an empty detail page;
+* `bpx-<slug>` ids scrape the source first, then ask the providers to fill
+  cast / genres / runtime / rating, and keep `imdb_id` when one matches.
+
+The source always wins a conflict: it is the site the stream comes from, so its
+title, year and poster are the ones the user recognises. Every shape is
+normalised before it ships: Cinemeta sends `director` as a list and no `year`
+(only `releaseInfo`), the site sends comma strings.
 
 Listing pages are cached **parsed** (never the raw 375 KB HTML) and served
 stale-while-revalidate, so a shelf refresh never makes a user wait for a proxied
 fetch. Boot prewarms all three shelves on their own thread.
+
+### Latency: the shelf teaches the stream endpoint
+
+Two things made the first tap on a series slow, and both are fixed by remembering
+what a catalog build already learned:
+
+* **`tt…` → slug index.** Building a shelf asks IMDb for every card's id anyway,
+  so the slug it came from is stored. `/stream` then goes straight to
+  `/watch/<slug>.html` instead of paying for an autocomplete round trip — one
+  fewer proxied fetch (~2 s on a flagged egress) per title.
+* **Shelf prewarm.** Serving the *first* page of a catalog warms streams for the
+  first `BPX_PREWARM_STREAMS` cards in the background, so the titles a user is
+  most likely to tap are already resolved and cached by the time they tap one.
+  Search results and deep pages are never prewarmed.
 
 ### Configuration
 
@@ -249,6 +272,7 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 | `BPX_PROXY_TRY` | `5` | exits raced concurrently per fetch |
 | `BPX_POOL_MAX` | `20` | trained exits kept |
 | `BPX_PREWARM` | `1` | `0` = do not warm the catalog shelves at boot |
+| `BPX_PREWARM_STREAMS` | `6` | cards warmed per served shelf page, `0` = off |
 | `BPX_DEBUG_KEY` | `bpx-dbg-4c9e` | `/debug/*` key — **change this in prod** |
 | `TMDB_API_KEY` | built-in | metadata + alternative titles |
 

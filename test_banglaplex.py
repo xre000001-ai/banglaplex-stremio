@@ -2350,6 +2350,203 @@ def test_build_meta_ships_a_year_for_cinemeta_shapes():
     assert m["year"] == 2026
 
 
+def test_needs_provider_is_the_mirror_of_needs_site():
+    assert addon._needs_provider(None) is False
+    assert addon._needs_provider({"cast": ["a"], "genres": ["Drama"],
+                                  "description": "d"}) is False
+    for hole in ("cast", "genres", "description"):
+        m = {"cast": ["a"], "genres": ["Drama"], "description": "d"}
+        m.pop(hole)
+        assert addon._needs_provider(m) is True, hole
+
+
+def test_build_meta_tt_with_no_provider_at_all_falls_back_via_the_id():
+    """prod bug: /meta/series/tt43695931 answered {} because no provider knows a
+    brand-new id, so there was no NAME to search the site with. The name must be
+    resolved FROM the id first, then the source scraped."""
+    clear_caches()
+    with mock.patch.object(addon, "_provider_meta", return_value=None), \
+         mock.patch.object(addon, "resolve_meta_all",
+                           return_value=[("Dahan", 2026, None)]) as rma, \
+         mock.patch.object(addon, "_site_meta_for",
+                           return_value=addon.meta_from_page(_PAGE_FIX, "series")) as smf:
+        m = addon.build_meta("series", "tt43695931")
+    assert rma.called, "the id must be resolved to a name"
+    assert smf.call_args[0][1] == "Dahan" and smf.call_args[0][2] == 2026
+    assert m["name"] == "Harudu" or m["name"] == "Dahan"
+    assert m["id"] == "tt43695931" and m["type"] == "series"
+    assert m["poster"].endswith("9.jpg")
+
+
+def test_build_meta_tt_keeps_provider_name_over_source_name():
+    clear_caches()
+    thin = {"name": "Official Title", "poster": "", "description": ""}
+    with mock.patch.object(addon, "_provider_meta", return_value=thin), \
+         mock.patch.object(addon, "_site_meta_for",
+                           return_value=addon.meta_from_page(_PAGE_FIX, "movie")):
+        m = addon.build_meta("movie", "tt1234567")
+    assert m["name"] == "Official Title", m["name"]
+    assert m["poster"].endswith("9.jpg")
+
+
+def test_build_meta_source_id_asks_providers_too():
+    """the fallback must run BOTH ways: the site page for a Bangla series often
+    has no cast/runtime/rating while TMDB/Cinemeta do."""
+    clear_caches()
+    src_meta = addon.meta_from_page({"slug": "queens", "title": "Queens", "year": 2026,
+                                     "poster": "https://x/p.jpg",
+                                     "plot": "A story."}, "series")
+    prov = {"cast": ["Actor One", "Actor Two"], "runtime": "45 min",
+            "imdbRating": "7.8", "poster": "https://provider/other.jpg"}
+    with mock.patch.object(addon, "_site_meta_for", return_value=src_meta), \
+         mock.patch.object(addon, "imdb_suggest_title", return_value="tt9999999") as sg, \
+         mock.patch.object(addon, "_provider_meta", return_value=prov):
+        m = addon.build_meta("series", "bpx-queens")
+    assert sg.call_args[0][0] == "Queens"
+    assert m["cast"] == ["Actor One", "Actor Two"], "provider fills the hole"
+    assert m["runtime"] == "45 min" and m["imdbRating"] == "7.8"
+    assert m["poster"] == "https://x/p.jpg", "the SOURCE stays authoritative"
+    assert m["id"] == "bpx-queens" and m["imdb_id"] == "tt9999999"
+
+
+def test_build_meta_source_id_does_not_guess_a_provider():
+    clear_caches()
+    src_meta = addon.meta_from_page(_PAGE_FIX, "movie")
+    with mock.patch.object(addon, "_site_meta_for", return_value=src_meta), \
+         mock.patch.object(addon, "imdb_suggest_title", return_value=None), \
+         mock.patch.object(addon, "_provider_meta",
+                           side_effect=AssertionError("no id, no provider call")):
+        m = addon.build_meta("movie", "bpx-harudu")
+    assert m["name"] == "Harudu" and "imdb_id" not in m
+
+
+def test_build_meta_source_id_skips_providers_when_the_page_is_full():
+    clear_caches()
+    full = addon.meta_from_page(_PAGE_FIX, "movie")
+    with mock.patch.object(addon, "_site_meta_for", return_value=full), \
+         mock.patch.object(addon, "imdb_suggest_title",
+                           side_effect=AssertionError("must not be asked")):
+        assert addon.build_meta("movie", "bpx-harudu")["name"] == "Harudu"
+
+
+# ── slug index: a catalog build teaches /stream where the file lives ─────────
+def test_map_ids_records_the_slug_for_mapped_items():
+    clear_caches()
+    items = [{"slug": "dahan", "title": "Dahan", "year": 2026},
+             {"slug": "queens", "title": "Queens", "year": 2026}]
+    with mock.patch.object(addon, "imdb_suggest_title",
+                           side_effect=lambda t, y=None, c="movie":
+                           "tt43695931" if t == "Dahan" else None):
+        addon._map_ids(items, "series")
+    assert addon.C_SLUG.get(("series", "tt43695931")) == (True, "dahan")
+    assert addon.C_SLUG.get(("series", "bpx-queens"))[0] is False
+
+
+def test_build_inner_uses_the_slug_index_and_skips_the_search_hop():
+    """on a flagged egress every site fetch rides a proxy (~2 s): a slug learned
+    from the catalog removes one whole hop."""
+    clear_caches()
+    addon.C_SLUG.put(("movie", "tt777"), "harudu", 600)
+    with mock.patch.object(addon, "resolve_meta_all",
+                           return_value=[("Harudu", 2026, None)]), \
+         mock.patch.object(addon, "search_candidates",
+                           side_effect=AssertionError("must not search")), \
+         mock.patch.object(addon, "parse_watch_page", return_value=_PAGE_FIX) as pw, \
+         _stub_resolve([_card()]):
+        out = addon._build_inner("movie", "tt777", None, None, time.time() + 5)
+    assert len(out["streams"]) == 1
+    assert pw.call_args[0][0].endswith("/watch/harudu.html")
+
+
+def test_build_inner_falls_through_when_the_slug_index_is_stale():
+    clear_caches()
+    addon.C_SLUG.put(("movie", "tt777"), "gone-slug", 600)
+    page = dict(_PAGE_FIX, slug="gone-slug", url="https://banglaplex.biz/watch/gone-slug.html")
+    with mock.patch.object(addon, "resolve_meta_all",
+                           return_value=[("Harudu", 2026, None)]), \
+         mock.patch.object(addon, "_cards_from_matches",
+                           side_effect=[[], [_card()]]), \
+         mock.patch.object(addon, "search_candidates",
+                           return_value=[{"title": "Harudu",
+                                          "url": "https://banglaplex.biz/watch/harudu.html"}]), \
+         mock.patch.object(addon, "match_candidates",
+                           return_value=[{"url": "https://banglaplex.biz/watch/harudu.html"}]), \
+         mock.patch.object(addon, "parse_watch_page", return_value=page):
+        out = addon._build_inner("movie", "tt777", None, None, time.time() + 5)
+    assert len(out["streams"]) == 1, "a stale slug must not blank the title"
+
+
+# ── shelf prewarm ────────────────────────────────────────────────────────────
+def test_prewarm_shelf_is_bounded_and_skips_cached():
+    clear_caches()
+    addon._PREWARM_BUSY[0] = False
+    metas = [{"id": "tt1"}, {"id": "bpx-two"}, {"id": "tt3"}, {"id": "tt4"},
+             {"id": "tt5"}, {"id": "tt6"}, {"id": "tt7"}, {"id": "tt8"}]
+    addon.C_STREAM.put(("movie", "tt1", None, None), [_card()], 600)
+    started = []
+
+    class FakeThread:
+        def __init__(self, target=None, daemon=None, name=None):
+            self.fn, self.n = target, name
+
+        def start(self):
+            started.append(self.n)
+            self.fn()
+    with mock.patch.object(addon.threading, "Thread", FakeThread), \
+         mock.patch.object(addon, "build_streams",
+                           side_effect=lambda t, i, s, e: started.append(i) or
+                           {"streams": []}), \
+         mock.patch.object(addon, "PREWARM_N", 4):
+        addon._prewarm_shelf(metas, "movie")
+    warmed = [x for x in started if isinstance(x, str) and x not in ("shelfwarm",)]
+    assert warmed == ["bpx-two", "tt3", "tt4"], warmed      # tt1 cached, capped at 4
+    assert "shelfwarm" in started
+    assert addon._PREWARM_BUSY[0] is False, "the busy flag must be released"
+
+
+def test_prewarm_shelf_single_flight_and_kill_switch():
+    clear_caches()
+    addon._PREWARM_BUSY[0] = True
+    with mock.patch.object(addon.threading, "Thread",
+                           side_effect=AssertionError("must not spawn")):
+        addon._prewarm_shelf([{"id": "tt1"}], "movie")
+    addon._PREWARM_BUSY[0] = False
+    with mock.patch.object(addon, "PREWARM_N", 0), \
+         mock.patch.object(addon.threading, "Thread",
+                           side_effect=AssertionError("must not spawn")):
+        addon._prewarm_shelf([{"id": "tt1"}], "movie")
+
+
+def test_prewarm_shelf_survives_a_build_error():
+    clear_caches()
+    addon._PREWARM_BUSY[0] = False
+
+    class FakeThread:
+        def __init__(self, target=None, daemon=None, name=None):
+            self.fn = target
+
+        def start(self):
+            self.fn()
+    with mock.patch.object(addon.threading, "Thread", FakeThread), \
+         mock.patch.object(addon, "build_streams", side_effect=RuntimeError("boom")):
+        addon._prewarm_shelf([{"id": "tt1"}], "movie")
+    assert addon._PREWARM_BUSY[0] is False
+
+
+def test_http_catalog_prewarms_only_the_first_plain_page():
+    clear_caches()
+    addon._PREWARM_BUSY[0] = False
+    calls = []
+    with mock.patch.object(addon, "catalog_items",
+                           return_value=[{"id": "tt1"}, {"id": "tt2"}]), \
+         mock.patch.object(addon, "_prewarm_shelf",
+                           side_effect=lambda m, t: calls.append((len(m), t))):
+        _http_get("/catalog/movie/bpx-latest.json")
+        _http_get("/catalog/movie/bpx-latest.json?skip=24")
+        _http_get("/catalog/movie/bpx-latest.json?search=x")
+    assert calls == [(2, "movie")], calls
+
+
 def test_needs_site_only_for_visible_holes():
     assert addon._needs_site(None) is True
     assert addon._needs_site({"poster": "p"}) is True
