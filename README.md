@@ -53,6 +53,47 @@ IMDb id
 | 3 | **Abyss** (`abyssplayer.com`) | `proxyHeaders.Referer` + `notWebReady` | SoTrym player. The `datas` blob decrypts to a per-quality source list, and the origin's own `/sora/{size}/{token}` route serves the **whole file as a progressive MP4** once it is handed a token it minted the key for. `ftyp` verified at byte 0 before a card is emitted. Files over 500 MiB play straight through — no seeking (see Known limits) |
 | — | `bestx.stream` / `chillx.top` | — | DNS resolves, TLS handshake fails (dead) → honest skip. Only affects 2023-24 catalog entries |
 
+### The browser card: seeking on a file that cannot seek
+
+Abyss files above the origin's 500 MiB `Range` ceiling play straight through in a
+native player — no scrubbing. The site's own web player does not have that
+problem: its service worker synthesises a `#EXT-X-BYTERANGE` playlist, so seeking
+works at any size.
+
+So when **none** of the verified native cards can seek, one extra card is emitted:
+
+```
+♧ 1080p  ✹ Queens  ·browser
+◫ S01 E01 ◇ ⚠ opens in a browser, seeking works ◇ ▤ 2.65 GB ◇ ▧ H264
+externalUrl → https://<host>/player/<abyss-id>
+```
+
+`/player/<id>` is a ~600-byte HTML shell that iframes `abyssplayer.com/<id>`. The
+iframe is the entire trick: that page carries anti-hotlink JS
+
+```js
+if (top.location == self.location && !/^(.+?)\.abyss\.to$/.test(hostname))
+    window.location = "https://abyss.to";     // a top-level window is thrown away
+```
+
+so linking the player URL directly (what an `externalUrl` card used to do) lands
+the user on `abyss.to`. Inside an iframe `top.location != self.location` and the
+real player stays put. `abyssplayer.com` sends no `X-Frame-Options` and no CSP,
+which is why this works at all. The id is charset-restricted
+(`[A-Za-z0-9]{4,64}`) — anything else is a 404, never a template injection.
+
+Rules around it, all tested:
+
+- **Never replaces a native card** — it is appended after them, and a build that
+  verified nothing emits no card of any kind (no phantom browser card).
+- **Only when nothing can seek.** If any quality is under the ceiling, the native
+  cards already do the job and no browser card is offered.
+- **Outside the `n` cap.** It is a different playback mode, not another quality,
+  so it never costs the user a 720p card. `bc=0` (config page) or
+  `BPX_BROWSER_CARD=0` turns it off entirely.
+- **Still zero media bytes.** Render serves the HTML shell; the browser pulls
+  video from the abyss origin.
+
 ### Series model
 
 Each `?key=` entry on a watch page is **one video file**, not a folder of
@@ -182,6 +223,7 @@ https://host/eyJjYXQiOiJzZXJpZXMifQ/manifest.json
 | `q` | `all` `720` `1080` | minimum resolution floor (unmeasured cards are never dropped) |
 | `cdn` | `both` `tiktok` `cf` | server preference — a *preference*: if the title only has the other server, that card still ships instead of an empty list |
 | `subs` | `en,hi,bn,…` or `off` | subtitle languages, leftmost wins (reorders + filters the track list and the `⟡ N SUB` label) |
+| `bc` | `1` `0` | offer the browser card when no native card can seek |
 | `cat` | `all` `movie` `series` `off` | which shelves appear in the board |
 | `tmdb` | 32-char key | the user's own TMDB key for richer art (validated live via `/validate-key`) |
 
@@ -197,7 +239,9 @@ URLs point straight at `bpx.strp2p.site` / `tiktokcdn.com` / the CF edge / the
 abyss `*.sssrr.org` origin, and subtitles are direct `.vtt` URLs. Abyss cards are
 the strongest form of this: the token is computed locally and the player pulls the
 MP4 from the origin itself — the addon never touches the video, not even its head
-beyond a 64-byte magic check. There are no `/hls`, `/seg`, `/proxy` or media
+beyond a 64-byte magic check. The only HTML served for playback is the `/player/`
+iframe shell (~600 B); the video inside it streams from the abyss origin to the
+user's browser, not through this process. There are no `/hls`, `/seg`, `/proxy` or media
 MIME routes in the source at all (`test_zero_bandwidth_no_media_routes` guards
 this). Playlist probing uses `stream=True` + an 8 KB head-read + `close()`,
 because the 3n1 frontends **ignore `Range` on variant playlists** and would
@@ -219,6 +263,8 @@ backends behind the load balancer answers a ranged request with a 400).
   `1080p`, no `0 SUB`, no runtime we didn't parse). An abyss card says
   `no seeking (plays straight through)` when the file is above the origin's range
   ceiling, instead of letting the player discover it mid-film.
+- **Cards carry a poster.** The stream picker shows the site's own thumb next to
+  every card; the client fetches the image, never us.
 - **No borrowed sizes.** The `▤` token only ever shows a real media byte count.
   A master playlist's own length (323 B) once printed as the size of a 1080p
   feature; the playlist probe now reports `pl_bytes` and the card ignores it.
@@ -244,6 +290,7 @@ backends behind the load balancer answers a ranged request with a 400).
 | `/meta/{type}/{id}.json` | detail page — providers + source fallback |
 | `/stream/{movie\|series}/{tt…\|bpx-…[:S:E]}.json` | the cards |
 | `/subtitles/{type}/{id}[/{extra}].json` | subtitle tracks for players that ask separately |
+| `/player/{abyss-id}` | ~600 B HTML shell that iframes the site's own player (the seek fallback) |
 | `/health` | version, uptime, stats, per-cache bytes, keepalive state |
 | `/debug/…?k=BPX_DEBUG_KEY` | `search` `page` `embed` `n1` `chain` `resolve` `reqlog` `mem` `net` |
 | `/{config}/…` | any route with a per-install config segment |
@@ -289,6 +336,7 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 | `BPX_CARDS` | `1` | `0` = kill switch, answers empty |
 | `BPX_INHOUSE` | `0` | `1` = also emit the IP-bound raw-IP path (debug only) |
 | `BPX_ABYSS` | `1` | `0` = kill switch for the abyssplayer path |
+| `BPX_BROWSER_CARD` | `1` | `0` = never offer the `/player/` iframe card |
 | `BPX_PROXY` | `auto` | `0` = never use the free proxy pool |
 | `BPX_PROXY_SOURCE` | proxyscrape | free HTTP proxy list URL(s), comma-separated |
 | `BPX_PROXY_LIST` | *(none)* | hand-picked exits (`http://user:pass@host:port,…`) — always ride first |
@@ -304,7 +352,7 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 ## Tests
 
 ```bash
-python3 test_banglaplex.py           # 248 offline tests, every network call mocked
+python3 test_banglaplex.py           # 258 offline tests, every network call mocked
 BPX_LIVE=1 python3 test_banglaplex.py # + 4 live integration tests (real site/CDN)
 ```
 
@@ -358,7 +406,8 @@ rate-limit budget, so don't loop it.
   emitted — `moov` sits at the front, so playback starts instantly and runs
   linearly — and says `no seeking (plays straight through)`. Most 1080p features
   are above the ceiling; 480p/720p renditions of the same title usually are not,
-  which is why up to three qualities are offered.
+  which is why up to three qualities are offered, plus one `·browser` card that
+  opens the site's own player where seeking does work.
 - **Abyss titles carry no subtitle tracks.** The `datas` blob holds `media`,
   `config` and `danmu` only — no caption list exists to scrape, so those cards
   honestly show no `⟡ N SUB`.

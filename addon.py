@@ -51,7 +51,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.4.1"
+VERSION    = "1.5.0"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -1538,6 +1538,7 @@ ABYSS_FRAG     = 2097152                    # the player's own fragment size
 ABYSS_RANGE_MAX = 524288000                 # 500 MiB: Range stops being honoured
 ABYSS_MAX_CARDS = 3
 ABYSS_ON       = os.environ.get("BPX_ABYSS", "1") != "0"
+BROWSER_CARD_ON = os.environ.get("BPX_BROWSER_CARD", "1") != "0"
 
 _SBOX = [
     0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
@@ -1787,6 +1788,7 @@ def resolve_abyss(abyss_url, page=None, note="", ctype="movie", se=None, ep=None
         picks.append((src, url, seekable,
                       _V_EX.submit(_abyss_probe, url, seekable)))
     cards = []
+    seek_any = False
     budget = max(0.5, (deadline or (time.time() + 20)) - time.time())
     for src, url, seekable, f in picks:
         if len(cards) >= MAX_CARDS:
@@ -1800,6 +1802,7 @@ def resolve_abyss(abyss_url, page=None, note="", ctype="movie", se=None, ep=None
             _STATS["abyss_fail"] = _STATS.get("abyss_fail", 0) + 1
             continue
         _STATS["abyss_ok"] = _STATS.get("abyss_ok", 0) + 1
+        seek_any = seek_any or bool(seekable)
         info = {"best": (0, 0), "label": src["label"], "size": src["size"],
                 "media_size": src["size"], "codec": src["codec"],
                 "seekable": seekable, "probe": code}
@@ -1809,7 +1812,47 @@ def resolve_abyss(abyss_url, page=None, note="", ctype="movie", se=None, ep=None
             n = (n + " ◇ " if n else "") + "no seeking (plays straight through)"
         cards.append(format_card("abyss", url, ABYSS_REFERER, "Abyss", info, pg,
                                  {}, note=n))
+    if cards and not seek_any and BROWSER_CARD_ON:
+        bc = browser_card(abyss_url, srcs, pg, note)
+        if bc:
+            cards.append(bc)
     return cards
+
+
+_ABYSS_ID_RE = re.compile(r"abyssplayer\.com/([A-Za-z0-9]{4,64})")
+
+
+def browser_card(abyss_url, srcs, pg, note=""):
+    """One `externalUrl` card that opens the site's OWN player in a browser.
+
+    Why this exists at all: above ABYSS_RANGE_MAX the origin stops honouring
+    `Range`, so a native card can only play straight through. The browser player
+    synthesises a BYTERANGE playlist in a service worker, so seeking works there.
+    It is offered *in addition to* the verified native cards, never instead of
+    them, and only when none of them can seek — so it is not a phantom card (the
+    media JSON decrypted and at least one origin URL answered) and not a downgrade.
+
+    We serve the iframe ourselves rather than linking `abyssplayer.com/<id>`
+    directly: that page carries anti-hotlink JS
+    (`if (top.location == self.location) window.location = "https://abyss.to"`),
+    which throws a browser straight at abyss.to. Inside an iframe
+    `top.location != self.location`, so the player stays put. Only a ~600-byte
+    HTML shell is served — no media byte touches this process."""
+    m = _ABYSS_ID_RE.search(abyss_url or "")
+    if not m:
+        return None
+    best = (srcs or [{}])[0]              # abyss_sources() already ranks best-first
+    info = {"best": (0, 0), "label": best.get("label") or "",
+            "codec": best.get("codec") or "", "media_size": best.get("size") or 0}
+    c = format_card("abyss-web", "/player/" + m.group(1), "", "Abyss · browser",
+                    info, pg, {},
+                    note=(note + " ◇ " if note else "") + "opens in a browser, "
+                         "seeking works")
+    c["externalUrl"] = c.pop("url")
+    c.pop("behaviorHints", None)          # a browser card needs no proxy headers
+    c["name"] += "  ·browser"
+    c["_ext"] = True
+    return c
 
 
 # ══════════════════════════════════════════════════════ 10. MEDIA CANDIDATES
@@ -2075,7 +2118,28 @@ def format_card(kind, master_url, referer, server_label, info, page,
             "_cdn": kind, "_res": res, "_tier": tier, "_nsubs": len(subs)}
     if subs:
         card["subtitles"] = subs
+    if (page or {}).get("poster"):
+        # the stream picker shows a thumb next to each card (the Node addon does
+        # this); the image is fetched by the client, never relayed through us
+        card["poster"] = page["poster"]
     return card
+
+
+def _mark_alts(cards):
+    """Every card after the first competing QUALITY is an alternative. The browser
+    fallback card is a different playback mode rather than another quality, so it
+    never earns an `· alt` suffix."""
+    alts = [c for c in cards if not c.get("_ext")]
+    for c in alts[1:]:
+        c["name"] += " · alt"
+    return cards
+
+
+def _cap_cards(cards):
+    """MAX_CARDS bounds the competing quality cards; one browser-fallback card
+    rides along outside that budget (apply_cfg enforces the same rule per config)."""
+    ext = [c for c in cards if c.get("_ext")]
+    return [c for c in cards if not c.get("_ext")][:MAX_CARDS] + ext[:1]
 
 
 # ═══════════════════════════════════════════════════════ 13. BUILD PIPELINE
@@ -2242,10 +2306,9 @@ def _build_inner(ctype, imdb, se, ep, deadline):
             return {"streams": [],
                     "message": "matched %s but no playable/verified source "
                                "(unsupported player or dead file)" % BRAND}
-        for i in range(1, len(cards)):
-            cards[i]["name"] += " · alt"
+        _mark_alts(cards)
         _STATS["cards"] += len(cards)
-        return {"streams": cards[:MAX_CARDS]}
+        return {"streams": _cap_cards(cards)}
     metas = resolve_meta_all(ctype, imdb)
     if not metas:
         return {"streams": [], "message": "no metadata for this id"}
@@ -2259,11 +2322,10 @@ def _build_inner(ctype, imdb, se, ep, deadline):
         cards = _cards_from_matches([{"url": SITE + "/watch/%s.html" % slug}],
                                     years, ctype, se, ep, deadline)
         if cards:
-            for i in range(1, len(cards)):
-                cards[i]["name"] += " · alt"
+            _mark_alts(cards)
             _STATS["cards"] += len(cards)
             _STATS["slug_hits"] = _STATS.get("slug_hits", 0) + 1
-            return {"streams": cards[:MAX_CARDS]}
+            return {"streams": _cap_cards(cards)}
     searched = matched_any = transient = False
     for name, year, _tid in metas:
         if time.time() >= deadline:
@@ -2284,10 +2346,9 @@ def _build_inner(ctype, imdb, se, ep, deadline):
         matched_any = True
         cards = _cards_from_matches(matched, years, ctype, se, ep, deadline)
         if cards:
-            for i in range(1, len(cards)):
-                cards[i]["name"] += " · alt"
+            _mark_alts(cards)
             _STATS["cards"] += len(cards)
-            return {"streams": cards[:MAX_CARDS]}
+            return {"streams": _cap_cards(cards)}
     if not searched:
         return {"streams": [],
                 "message": ("%s search is not answering right now (transient)"
@@ -2456,6 +2517,7 @@ CFG_DEFAULTS = {
     "cdn": "both",         # "both" | "tiktok" | "cf"  (server preference)
     "cat": "all",          # "all" | "movie" | "series" | "off"
     "tmdb": "",            # the user's OWN TMDB v3 key — never stored server-side
+    "bc": "1",             # "1" = offer the browser card when nothing can seek
 }
 _CFG_TLS = threading.local()
 _Q_TIERS = {"all": 0, "720": 1, "1080": 2}
@@ -2503,6 +2565,9 @@ def cfg_unpack(seg):
                        "cat": ("all", "movie", "series", "off")}[k]
             if v.lower() in allowed:
                 cfg[k] = v.lower()
+        elif k == "bc":
+            if v in ("0", "1"):
+                cfg["bc"] = v
         elif k == "tmdb":
             if re.fullmatch(r"[A-Za-z0-9]{20,64}", v):
                 cfg["tmdb"] = v
@@ -2527,8 +2592,11 @@ def apply_cfg(cards, cfg=None):
         [x.strip().lower() for x in (cfg.get("subs") or "").split(",") if x.strip()]
     minq = _Q_TIERS.get(cfg.get("q") or "all", 0)
     cdn = (cfg.get("cdn") or "both").lower()
+    all_cards = list(cards or [])
+    ext = [c for c in all_cards if c.get("_ext")]      # browser fallback, if any
+    media = [c for c in all_cards if not c.get("_ext")]
     pool = []
-    for c in cards or []:
+    for c in media:
         rank = _Q_RANK.get(c.get("_res") or "", 0)
         # an UNMEASURED resolution (rank 0) is never dropped: the site sometimes
         # labels a file "HDTC" with no playlist to measure, and hiding it would
@@ -2555,10 +2623,16 @@ def apply_cfg(cards, cfg=None):
                                           c.get("description") or "")
             else:
                 c.pop("subtitles", None)
-        for k in ("_cdn", "_res", "_tier", "_nsubs"):
+        for k in ("_cdn", "_res", "_tier", "_nsubs", "_ext"):
             c.pop(k, None)
         out.append(c)
-    return out[:max(1, int(cfg.get("n") or MAX_CARDS))]
+    out = out[:max(1, int(cfg.get("n") or MAX_CARDS))]
+    if ext and BROWSER_CARD_ON and str(cfg.get("bc") or "1") != "0":
+        e = dict(ext[0])
+        for k in ("_cdn", "_res", "_tier", "_nsubs", "_ext"):
+            e.pop(k, None)
+        out.append(e)          # a playback mode, not another quality: outside `n`
+    return out
 
 
 # ── site listing parse ───────────────────────────────────────────────────────
@@ -3236,6 +3310,13 @@ direct CDN streams, own catalogs, zero server bandwidth.</p>
 <select id="cdn"><option value="both">Both</option>
 <option value="tiktok">TikTok CDN first only</option>
 <option value="cf">Cloudflare only</option></select></div>
+<div class="row"><div><label>Browser card when nothing can seek</label>
+<span class="hint">Abyss files over 500&nbsp;MiB only play straight through in
+Stremio. This adds one extra card that opens the site's own player in a browser,
+where seeking works. It is offered only when no native card can seek, and no
+media passes through this service.</span></div>
+<select id="bc"><option value="1">Offer it</option>
+<option value="0">Never</option></select></div>
 <div class="row"><div><label>Subtitles</label>
 <span class="hint">Tap languages to reorder — leftmost wins</span></div>
 <div class="chips" id="subs"></div></div>
@@ -3284,7 +3365,7 @@ function buildUI(){
   for(let i=1;i<=NMAX;i++){const o=document.createElement("option");
     o.value=i;o.textContent=i+(i===1?" card":" cards");n.appendChild(o);}
   n.value=CFG.n; n.onchange=()=>{CFG.n=parseInt(n.value);render();};
-  for(const k of ["q","cdn","cat"]){
+  for(const k of ["q","cdn","cat","bc"]){
     const el=document.getElementById(k); el.value=CFG[k];
     el.onchange=()=>{CFG[k]=el.value;render();};
   }
@@ -3396,13 +3477,37 @@ second) + multi-language VTT subtitles.</li>
 </div></body></html>"""
 
 
+# ══════════════════════════════════════════ 14b. BROWSER PLAYER SHELL (abyss)
+# `abyssplayer.com/<id>` carries anti-hotlink JS: a TOP-LEVEL window is sent to
+# https://abyss.to. Inside an iframe `top.location != self.location`, so the real
+# player stays put and its service worker can build the BYTERANGE playlist that
+# makes seeking work on files too big for the origin's Range ceiling. This is the
+# only HTML this addon serves for playback, and it relays nothing: the browser
+# pulls media from the abyss origin itself.
+PLAYER_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>__NAME__</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}html,body{height:100%;background:#000}
+iframe{width:100%;height:100%;border:0;display:block}</style></head>
+<body><iframe src="https://abyssplayer.com/__PID__" allowfullscreen
+ allow="autoplay; encrypted-media; fullscreen; picture-in-picture"></iframe>
+</body></html>"""
+
+# charset-restricted on purpose: the id is interpolated into HTML, so anything
+# outside [A-Za-z0-9] is a 404 rather than a template injection
+_PLAYER_RE = re.compile(r"^/player/([A-Za-z0-9]{4,64})$")
+
+
 # ═══════════════════════════════════════════════════════════ 15. HTTP SERVER
 _STREAM_RE = re.compile(r"^/stream/(movie|series)/([^/]+)\.json$")
 _CAT_RE = re.compile(r"^/catalog/(movie|series)/([A-Za-z0-9_\-.]+)(?:/([^/]*))?\.json$")
 _META_RE = re.compile(r"^/meta/(movie|series)/([^/]+)\.json$")
 _TOP_ROUTES = {"stream", "catalog", "meta", "subtitles", "health", "manifest.json",
                "configure", "config", "debug", "validate-key", "install",
-               "index.html", "favicon.ico"}
+               # "player" must be here or do_GET reads it as a config segment and
+               # cfg_unpack("player") answers 404 before the route is ever seen
+               "player", "index.html", "favicon.ico"}
 # players call both /subtitles/{type}/{id}.json and the sdk-style
 # /subtitles/{type}/{id}/{extra}.json — accept either
 _SUBS_RE = re.compile(r"^/subtitles/(movie|series)/([^/]+?)(?:/[^/]*)?\.json$")
@@ -3456,8 +3561,11 @@ def _path_extras(tail):
 
 def _absolutize(cards, base):
     for c in cards:
-        if c.get("url", "").startswith("/"):
-            c["url"] = base + c["url"]
+        for k in ("url", "externalUrl"):
+            if str(c.get(k) or "").startswith("/"):
+                # relative on purpose: the build cache is shared across installs,
+                # and the public base differs per install (config-path prefix)
+                c[k] = base + c[k]
     return cards
 
 
@@ -3564,6 +3672,11 @@ class Handler(BaseHTTPRequestHandler):
                     .replace("__DEF__", json.dumps(CFG_DEFAULTS))
                     .replace("__NMAX__", str(MAX_CARDS)))
             return self._send(200, html, "text/html", cache=300)
+        m = _PLAYER_RE.match(path)
+        if m:
+            html = (PLAYER_PAGE.replace("__NAME__", ADDON_NAME)
+                    .replace("__PID__", m.group(1)))
+            return self._send(200, html, "text/html", cache=3600)
         if path == "/validate-key":
             return self._send(200, {"valid": validate_tmdb_key((q.get("key") or [""])[0])})
         m = _CAT_RE.match(path)

@@ -2723,8 +2723,9 @@ def test_resolve_abyss_probes_with_range_only_when_the_origin_honours_it():
 
 def test_resolve_abyss_emits_verified_cards_with_referer_headers():
     cards, pr, _ = _abyss_fixture_cards()
-    assert len(cards) == 3, [c["name"] for c in cards]
-    c0 = cards[0]
+    media = [c for c in cards if not c.get("_ext")]
+    assert len(media) == 3, [c["name"] for c in cards]
+    c0 = media[0]
     assert c0["url"].startswith("https://njuaynwkh47.sssrr.org/sora/2844976106/")
     assert c0["behaviorHints"]["proxyHeaders"]["request"]["Referer"] == \
         "https://abyssplayer.com/"
@@ -2735,9 +2736,114 @@ def test_resolve_abyss_emits_verified_cards_with_referer_headers():
     assert "Abyss" in c0["description"]
     # every emitted url was probed first: no phantom cards
     assert pr.call_count == 3
-    for c in cards:
+    for c in media:
         assert c["_cdn"] == "abyss" and c["_res"] in ("1080p", "720p", "480p")
         assert c["_tier"] == "", "a declared label earns no measured tier claim"
+
+
+def test_browser_card_appears_only_when_no_native_card_can_seek():
+    """The queens fixture has all three sources above ABYSS_RANGE_MAX, so none of
+    the native cards can seek — that is the only situation where pointing a user
+    at the site's own browser player adds something."""
+    cards, _pr, _m = _abyss_fixture_cards()
+    ext = [c for c in cards if c.get("_ext")]
+    assert len(ext) == 1, [c["name"] for c in cards]
+    e = ext[0]
+    assert e["externalUrl"] == "/player/eLY0XBgBP"
+    assert "url" not in e, "an externalUrl card must not also claim a stream url"
+    assert "behaviorHints" not in e, "a browser card needs no proxy headers"
+    assert "browser" in e["name"] and "seeking works" in e["description"]
+    assert e["_cdn"] == "abyss-web"
+
+    with mock.patch.object(addon, "ABYSS_RANGE_MAX", 10 ** 12):
+        seekable, _p, _m2 = _abyss_fixture_cards()     # every file now in range
+    assert not [c for c in seekable if c.get("_ext")], "nothing to fall back to"
+
+    with mock.patch.object(addon, "BROWSER_CARD_ON", False):
+        off, _p, _m3 = _abyss_fixture_cards()          # env kill switch
+    assert len(off) == 3 and not [c for c in off if c.get("_ext")]
+
+
+def test_browser_card_never_replaces_a_verified_card():
+    """Honesty order: the native card comes first, the browser card is appended.
+    A build that produced no verified card gets no browser card either — we do not
+    advertise a player page for media we could not confirm exists."""
+    cards, _pr, _m = _abyss_fixture_cards(probe=(403, False))
+    assert cards == [], "no verified media -> no card of any kind"
+
+
+def test_browser_card_rides_outside_the_card_cap_and_honours_bc():
+    cards, _pr, _m = _abyss_fixture_cards()
+    cfg = dict(addon.CFG_DEFAULTS)
+    cfg.update({"n": 2, "bc": "1"})
+    out = addon.apply_cfg(cards, cfg)
+    assert len(out) == 3, [c["name"] for c in out]     # 2 qualities + browser
+    assert out[-1]["externalUrl"] == "/player/eLY0XBgBP"
+    for k in ("_cdn", "_res", "_tier", "_nsubs", "_ext"):
+        assert k not in out[-1], "private markers must be stripped"
+    cfg["bc"] = "0"
+    off = addon.apply_cfg(cards, cfg)
+    assert len(off) == 2 and not [c for c in off if c.get("externalUrl")]
+
+
+def test_cap_cards_and_mark_alts_treat_the_browser_card_as_not_a_quality():
+    media = [{"name": "a%d" % i, "_cdn": "abyss"} for i in range(addon.MAX_CARDS + 2)]
+    ext = [{"name": "browser", "_ext": True}]
+    out = addon._cap_cards(media + ext)
+    assert len(out) == addon.MAX_CARDS + 1 and out[-1]["_ext"] is True
+    cards = [{"name": "A"}, {"name": "B"}, {"name": "C", "_ext": True}]
+    addon._mark_alts(cards)
+    assert [c["name"] for c in cards] == ["A", "B · alt", "C"]
+
+
+def test_absolutize_prefixes_external_urls_too():
+    cards = [{"url": "/x/master.m3u8"}, {"externalUrl": "/player/abc123"}]
+    addon._absolutize(cards, "https://svc.onrender.com/cfgseg")
+    assert cards[0]["url"] == "https://svc.onrender.com/cfgseg/x/master.m3u8"
+    assert cards[1]["externalUrl"] == "https://svc.onrender.com/cfgseg/player/abc123"
+
+
+def test_player_route_serves_an_iframe_shell_and_nothing_else():
+    c = _http_get("/player/eLY0XBgBP")
+    assert c["code"] == 200
+    assert c["headers"]["Content-Type"].startswith("text/html")
+    body = c["body"].decode("utf-8")
+    assert '<iframe src="https://abyssplayer.com/eLY0XBgBP"' in body
+    assert "allowfullscreen" in body and "encrypted-media" in body
+    assert len(c["body"]) < 2000, "a shell, not a page full of anything"
+    # the anti-hotlink redirect is the whole reason this route exists
+    assert "abyss.to" not in body
+
+
+def test_player_route_also_works_behind_a_config_segment():
+    """An install configured through /configure gets `base` = <origin>/<cfgseg>,
+    and _absolutize builds the card's externalUrl from it — so the shell must be
+    reachable with that prefix, which means "player" has to be a top route."""
+    seg = addon.cfg_pack({"n": 2, "bc": "1"})
+    c = _http_get("/%s/player/eLY0XBgBP" % seg)
+    assert c["code"] == 200, c
+    assert b'abyssplayer.com/eLY0XBgBP' in c["body"]
+
+
+def test_player_route_rejects_anything_that_is_not_a_plain_id():
+    for bad in ('/player/<script>alert(1)</script>', '/player/a"onload="x',
+                "/player/..%2f..%2fetc", "/player/ab", "/player/",
+                "/player/" + "9" * 65):
+        c = _http_get(bad)
+        assert c["code"] == 404, (bad, c["code"])
+
+
+def test_config_page_exposes_the_browser_card_toggle():
+    c = _http_get("/configure")
+    body = c["body"].decode("utf-8")
+    assert 'id="bc"' in body and "seeking works" in body
+    assert '"bc"' in body, "the default config must carry bc so the UI can bind it"
+
+
+def test_cfg_round_trips_the_bc_toggle():
+    assert addon.cfg_unpack(addon.cfg_pack({"bc": "0"}))["bc"] == "0"
+    assert addon.cfg_unpack(addon.cfg_pack({"bc": "1"}))["bc"] == "1"
+    assert addon.cfg_unpack(addon.cfg_pack({"bc": "nonsense"}))["bc"] == "1"
 
 
 def test_resolve_abyss_refuses_an_origin_that_will_not_serve_ftyp():
@@ -2814,8 +2920,9 @@ def test_resolve_file_falls_back_to_abyss_when_3n1_is_dead():
          mock.patch.object(addon, "_abyss_probe", return_value=(206, True)):
         cards = addon._resolve_file(page, None, "Full", "", "series", 1, 1,
                                     time.time() + 20)
-    assert len(cards) == 3, cards
-    assert all(c["_cdn"] == "abyss" for c in cards)
+    media = [c for c in cards if not c.get("_ext")]
+    assert len(media) == 3, cards
+    assert all(c["_cdn"] == "abyss" for c in media)
 
 
 def test_resolve_file_prefers_3n1_and_only_uses_abyss_when_it_fails():
