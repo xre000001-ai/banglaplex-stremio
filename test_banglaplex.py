@@ -42,12 +42,15 @@ def run(test):
 def clear_caches():
     for c in (addon.C_SEARCH, addon.C_PAGE, addon.C_META, addon.C_EMBED,
               addon.C_N1, addon.C_STREAM, addon.C_LIST, addon.C_IMDB,
-              addon.C_METARES):
+              addon.C_METARES, addon.C_SLUG):
         c.clear()
         c.bytes = 0
     addon.C_STALE.clear()
     addon._NEG_RETRY_AT.clear()
     addon._SWR_RUNNING.clear()
+    addon._PREWARM_BUSY[0] = False      # a killed prewarm must not leak "busy"
+    # NOTE: never _STATS.clear() — it is a counter dict whose keys the /health
+    # surface and the tests read directly; emptying it raises KeyError.
     with addon._HOST_BLOCK_LOCK:
         addon._HOST_BLOCK.clear()
     for h in list(addon._N1_BUSY):
@@ -2499,7 +2502,10 @@ def test_prewarm_shelf_is_bounded_and_skips_cached():
          mock.patch.object(addon, "PREWARM_N", 4):
         addon._prewarm_shelf(metas, "movie")
     warmed = [x for x in started if isinstance(x, str) and x not in ("shelfwarm",)]
-    assert warmed == ["bpx-two", "tt3", "tt4"], warmed      # tt1 cached, capped at 4
+    # the first batch runs two-at-a-time on a real executor, so only the SET is
+    # deterministic — asserting an order here made this test flake.
+    assert sorted(warmed) == ["bpx-two", "tt3", "tt4"], warmed   # tt1 cached, cap 4
+    assert "tt1" not in warmed, "an already-cached card must not be re-warmed"
     assert "shelfwarm" in started
     assert addon._PREWARM_BUSY[0] is False, "the busy flag must be released"
 
@@ -2531,6 +2537,75 @@ def test_prewarm_shelf_survives_a_build_error():
          mock.patch.object(addon, "build_streams", side_effect=RuntimeError("boom")):
         addon._prewarm_shelf([{"id": "tt1"}], "movie")
     assert addon._PREWARM_BUSY[0] is False
+
+
+def _late_future():
+    """a fake executor handing back a future WE complete, so a build can be made
+    to outlive the answer wall on purpose."""
+    import concurrent.futures as cf
+    fut = cf.Future()
+
+    class FakeEx:
+        def submit(self, fn, *a, **k):
+            return fut
+    return fut, FakeEx()
+
+
+def test_a_build_that_outlives_the_wall_still_fills_the_cache():
+    """the player is told "tap again in a few seconds" — that promise used to be
+    empty, because the late worker result was dropped and the retry redid 20 s of
+    work. This is the cold-boot path (service just woke, pool untrained)."""
+    clear_caches()
+    fut, ex = _late_future()
+    with mock.patch.object(addon, "_BUILD_EX", ex), \
+         mock.patch.object(addon, "WALL", 0.2):
+        r = addon.build_streams("movie", "tt777", None, None)
+    assert r["streams"] == []
+    assert "still resolving" in r["message"]
+    assert addon.C_STREAM.get(("movie", "tt777", None, None))[0] is False
+    fut.set_result({"streams": [_card()]})          # worker finishes late
+    hit, val = addon.C_STREAM.get(("movie", "tt777", None, None))
+    assert hit and len(val) == 1, "the late answer must be adopted"
+    assert addon.C_STALE.get(("movie", "tt777", None, None)) is not None
+    with mock.patch.object(addon, "_BUILD_EX", ex):
+        r2 = addon.build_streams("movie", "tt777", None, None)
+    assert len(r2["streams"]) == 1, "the promised retry must be a cache hit"
+
+
+def test_a_late_empty_result_is_not_memoised():
+    clear_caches()
+    fut, ex = _late_future()
+    with mock.patch.object(addon, "_BUILD_EX", ex), \
+         mock.patch.object(addon, "WALL", 0.2):
+        addon.build_streams("movie", "tt778", None, None)
+    fut.set_result({"streams": [], "message": "not on BanglaPlex"})
+    assert addon.C_STREAM.get(("movie", "tt778", None, None))[0] is False, \
+        "an empty late answer must not become a cached negative"
+
+
+def test_a_late_result_does_not_clobber_a_newer_answer():
+    clear_caches()
+    fut, ex = _late_future()
+    first = _card()
+    addon.C_STREAM.put(("movie", "tt779", None, None), [first], 600)
+    with mock.patch.object(addon, "_BUILD_EX", ex), \
+         mock.patch.object(addon, "WALL", 0.2):
+        addon.build_streams("movie", "tt779", None, None)
+    newer = _card()
+    newer["url"] = "https://bpx.strp2p.site/hls/newer/master.m3u8"
+    fut.set_result({"streams": [newer]})
+    hit, val = addon.C_STREAM.get(("movie", "tt779", None, None))
+    assert hit and val[0] is first, "the served answer must win"
+
+
+def test_a_cancelled_or_raising_build_cannot_break_the_callback():
+    clear_caches()
+    fut, ex = _late_future()
+    with mock.patch.object(addon, "_BUILD_EX", ex), \
+         mock.patch.object(addon, "WALL", 0.2):
+        addon.build_streams("movie", "tt780", None, None)
+    fut.set_exception(RuntimeError("boom"))         # must be swallowed
+    assert addon.C_STREAM.get(("movie", "tt780", None, None))[0] is False
 
 
 def test_prewarm_shelf_survives_a_submit_failure():

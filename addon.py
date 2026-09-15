@@ -50,7 +50,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.3.1"
+VERSION    = "1.3.2"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -1957,6 +1957,29 @@ def _neg_bg_retry(ckey, fn):
     threading.Thread(target=fn, daemon=True).start()
 
 
+def _adopt_late_result(fut, key):
+    """A build that outlives the answer wall must still pay off.
+
+    Without this the worker's result was dropped on the floor: the player was
+    told "tap again in a few seconds", and tapping again redid the whole 20 s
+    resolve from scratch. That is exactly what a cold boot (Render wakes the
+    service, the proxy pool is still untrained, banglaplex.biz is Cloudflare-
+    flagged from our egress) looks like from the couch. Now the late answer is
+    cached by the worker thread itself, so the promised retry is a cache hit."""
+    try:
+        res = fut.result(timeout=0)
+        cards = (res or {}).get("streams") or []
+        if not cards:
+            return                                   # never memoise an empty
+        if C_STREAM.get(key)[0]:
+            return                                   # a newer answer already won
+        C_STREAM.put(key, cards, _STREAM_TTL)
+        C_STALE[key] = (time.time() + _STREAM_STALE, cards)
+        _STATS["late_adopts"] = _STATS.get("late_adopts", 0) + 1
+    except Exception:
+        pass                                         # cancelled / raised: ignore
+
+
 def build_streams(ctype, imdb, se, ep):
     key = (ctype, imdb, se, ep)
     hit, val = C_STREAM.get(key)
@@ -1974,6 +1997,7 @@ def build_streams(ctype, imdb, se, ep):
         return {"streams": stale[1]}
     _STATS["resolves"] += 1
     fut = _BUILD_EX.submit(_build_inner, ctype, imdb, se, ep, time.time() + WALL)
+    fut.add_done_callback(lambda f: _adopt_late_result(f, key))
     try:
         res = fut.result(timeout=WALL)
     except Exception:
@@ -1981,6 +2005,7 @@ def build_streams(ctype, imdb, se, ep):
     if res is None:
         # build still running in background: it will fill the cache; ask for a
         # retry instead of lying with an empty list.
+        _STATS["walls"] = _STATS.get("walls", 0) + 1
         _log({"t": int(time.time()), "id": imdb, "se": se, "ep": ep,
               "wall": True, "ms": int(WALL * 1000)})
         return {"streams": [],
