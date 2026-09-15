@@ -45,12 +45,12 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote, urljoin, urlparse, parse_qs
+from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.1.2"
+VERSION    = "1.2.0"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -107,11 +107,28 @@ MANIFEST = {
     "logo": SITE + "/uploads/system_logo/logo_619305d7d016f.png",
     "background": SITE + "/assets/images/default_bg.jpg",
     "types": ["movie", "series"],
-    "idPrefixes": ["tt"],
-    "resources": ["stream", "subtitles"],
-    "catalogs": [],
-    "behaviorHints": {"configurable": False},
+    "idPrefixes": ["tt", "bpx-"],
+    "resources": ["stream", "subtitles", "catalog", "meta"],
+    "catalogs": [],                 # filled in section 13b once CAT_DEFS exists
+    "behaviorHints": {"configurable": True, "configurationRequired": False},
 }
+
+
+def manifest(cfg=None):
+    """Per-install manifest: the catalog list follows the `cat` config so a user
+    who only wants streams does not get BanglaPlex shelves in their board."""
+    cfg = cfg or CFG_DEFAULTS
+    man = dict(MANIFEST)
+    man["version"] = VERSION
+    want = cfg.get("cat") or "all"
+    if want == "off":
+        man["catalogs"] = []
+        man["resources"] = [r for r in MANIFEST["resources"] if r != "catalog"]
+    elif want in ("movie", "series"):
+        man["catalogs"] = [c for c in CAT_DEFS if c["type"] == want]
+    else:
+        man["catalogs"] = list(CAT_DEFS)
+    return man
 
 # ═══════════════════════════════════════════════════════════════ 2. UTILITIES
 class TTLCache(dict):
@@ -170,6 +187,9 @@ C_META    = TTLCache(4 * 1024 * 1024, "meta")
 C_EMBED   = TTLCache(2 * 1024 * 1024, "embeds")
 C_N1      = TTLCache(8 * 1024 * 1024, "n1")
 C_STREAM  = TTLCache(12 * 1024 * 1024, "streams")
+C_LIST    = TTLCache(8 * 1024 * 1024, "listings")
+C_IMDB    = TTLCache(2 * 1024 * 1024, "imdbmap")
+C_METARES = TTLCache(6 * 1024 * 1024, "metares")
 C_STALE   = {}                                    # key -> (expiry, cards)
 _NEG_RETRY_AT = {}
 _SWR_RUNNING = set()
@@ -178,6 +198,7 @@ _SWR_LOCK = threading.Lock()
 _IO_EX   = ThreadPoolExecutor(max_workers=12, thread_name_prefix="io")
 _V_EX    = ThreadPoolExecutor(max_workers=6, thread_name_prefix="verify")
 _P_EX    = ThreadPoolExecutor(max_workers=10, thread_name_prefix="proxy")
+_PP_EX   = ThreadPoolExecutor(max_workers=16, thread_name_prefix="poolprobe")
 _BUILD_EX = ThreadPoolExecutor(max_workers=2, thread_name_prefix="build")
 
 _S = requests.Session()
@@ -440,26 +461,37 @@ def n1_decrypt(hexstr):
 # and the moment a host proves blocked from here, ride the free proxy pool
 # (house pattern — MovieBox §19). Nothing media-bearing ever goes through a
 # proxy: cards still point the player straight at the CDN.
-POOL_SRC = os.environ.get(
+POOL_SRCS = [s.strip() for s in os.environ.get(
     "BPX_PROXY_SOURCE",
     "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies"
-    "&proxy_type=http&proxy_format=protocolipport&format=text")
+    "&proxy_type=http&proxy_format=protocolipport&format=text").split(",") if s.strip()]
+# hand-picked exits (paid/reliable) always ride first and are never evicted by
+# the free-list trainer: BPX_PROXY_LIST="http://user:pass@host:port,http://h2:p2"
+POOL_MANUAL = [s.strip() for s in os.environ.get("BPX_PROXY_LIST", "").split(",")
+               if s.strip()]
 POOL_ON   = os.environ.get("BPX_PROXY", "auto") != "0"
-POOL_TTL  = 360.0          # refresh the list every 6 min
-POOL_MAX  = 40
+POOL_TTL  = 300.0          # re-pull the source list every 5 min
+POOL_MAX  = int(os.environ.get("BPX_POOL_MAX", "20"))   # trained exits kept
+POOL_CAND = 90             # candidates pulled from the sources per refresh
 POOL_TRY  = int(os.environ.get("BPX_PROXY_TRY", "5"))   # exits raced per fetch
 POOL_TO   = 8.0            # per-exit connect/read timeout (free proxies are slow)
+PROBE_TO  = 6.0            # training probe timeout
+PROBE_WAVE = 24            # wave size: publish as soon as wave 1 lands
 DIRECT_BLOCK_TTL = 600.0   # host benched for direct egress after a 403/503
 
 _HOST_BLOCK = {}
 _HOST_BLOCK_LOCK = threading.Lock()
-_POOL = [[]]               # ["http://ip:port", ...]
-_POOL_TS = [0.0]
+_POOL = [[]]               # current members (fastest/trained first)
+_POOL_TS = [0.0]           # last source pull
 _POOL_LOCK = threading.Lock()
 _POOL_BAD = {}             # exit -> benched-until
-_POOL_OK = {}              # exit -> (successes, last_ok)
+# trained records: exit -> {"ok": n, "fail": n, "lat": EWMA ms, "blocked": n}
+_POOL_STATS = {}
 _STICKY = [None, 0.0]      # ride one good exit for 90s (a chain, not a dice roll)
+_STICKY_BUSY = {}          # exit -> in-flight count (a sticky exit caps at 2)
 _DIRECT_BAD = {}           # host -> direct egress benched until
+_TRAINING = [False]        # one background trainer at a time
+_PROBE_URL = SITE + "/home/autocompleteajax?term=a"     # cheap (~360B) real-work probe
 
 
 def _bench(host, secs):
@@ -476,57 +508,187 @@ def _blocked_left(host=None):
         return max([0.0] + vals)
 
 
+def _pool_pull():
+    """Free-list sources -> deduped http(s) candidates.
+
+    socks4/socks5 exits need PySocks; without it requests raises InvalidSchema,
+    so every such exit looks "dead" (measured on prod: 40/40 exits were socks4
+    and the whole pool was unusable)."""
+    urls = list(POOL_MANUAL)
+    for src in POOL_SRCS:
+        try:
+            r = requests.get(src, timeout=12, headers={"User-Agent": UA})
+            for ln in (r.text or "").splitlines():
+                ln = ln.strip().strip(",")
+                if not ln or ln.startswith("#") or ":" not in ln:
+                    continue
+                if "://" not in ln:
+                    ln = "http://" + ln
+                if ln.split("://")[0] not in ("http", "https"):
+                    continue
+                urls.append(ln)
+        except Exception:
+            continue                      # one dead source must not kill the pull
+    return list(dict.fromkeys(urls))[:POOL_CAND]
+
+
+def _site_probe(u, timeout=None):
+    """Does this exit actually reach the BLOCKED host? -> (kind, ms).
+
+    kind: "good" (200), "blocked" (403/503 = the exit itself is flagged),
+    "dead" (timeout/connect error). A 200-with-empty-body still counts as good:
+    the site answers that way to a 1-letter term."""
+    t0 = time.time()
+    try:
+        r = _S.get(_PROBE_URL, timeout=timeout or PROBE_TO,
+                   headers={"User-Agent": UA, "Accept": "*/*",
+                            "Referer": SITE + "/"},
+                   proxies={"http": u, "https": u})
+    except Exception:
+        return "dead", int((time.time() - t0) * 1000)
+    ms = int((time.time() - t0) * 1000)
+    code = r.status_code
+    try:
+        r.close()
+    except Exception:
+        pass
+    if code in (403, 503):
+        return "blocked", ms
+    return ("good", ms) if code == 200 else ("dead", ms)
+
+
+def _pool_train(cands):
+    """Background trainer (MovieBox pattern): platform-probe the candidates in
+    parallel waves, publish wave 1 immediately so a usable pool exists early,
+    then keep the POOL_MAX fastest good exits, MERGED with the healthy members
+    already trained (never wholesale-replace: that throws away latency records
+    and the sticky pick)."""
+    now = time.time()
+    with _POOL_LOCK:
+        prev = [u for u in _POOL[0] if _POOL_BAD.get(u, 0.0) <= now]
+
+    def wave(batch):
+        got = []
+        futs = {_PP_EX.submit(_site_probe, u): u for u in batch}
+        for f in as_completed(futs, timeout=PROBE_TO + 12):
+            u = futs[f]
+            try:
+                kind, ms = f.result(timeout=0)
+            except Exception:
+                kind, ms = "dead", 9999
+            if kind == "good":
+                got.append((u, ms))
+            else:
+                _pool_note(u, False, blocked=(kind == "blocked"))
+        return got
+
+    alive = []
+    try:
+        alive = wave(cands[:PROBE_WAVE])
+        best = sorted(alive, key=lambda x: x[1])[:POOL_MAX]
+        _pool_publish(prev, best)
+        if len(cands) > PROBE_WAVE:
+            alive += wave(cands[PROBE_WAVE:])
+    except Exception:
+        pass
+    alive.sort(key=lambda x: x[1])                    # fastest first
+    _pool_publish(prev, alive[:POOL_MAX])
+    with _POOL_LOCK:
+        for u, ms in alive:                           # seed training records
+            st = _POOL_STATS.setdefault(u, {"ok": 0, "fail": 0, "lat": None})
+            st["ok"] += 1
+            st["lat"] = ms if st.get("lat") is None else int(0.6 * st["lat"] + 0.4 * ms)
+            _POOL_BAD.pop(u, None)
+        # bound the learning dicts: a long-lived instance otherwise keeps records
+        # for exits that left the pool long ago
+        live = set(_POOL[0]) | {u for u, t in _POOL_BAD.items() if t > time.time()}
+        for u in [u for u in _POOL_STATS if u not in live]:
+            _POOL_STATS.pop(u, None)
+
+
+def _pool_publish(prev, best):
+    """MERGE previous healthy members with the newly proven fastest ones."""
+    lat = {u: (_POOL_STATS.get(u) or {}).get("lat") for u in prev}
+
+    def key(u):
+        return (lat.get(u) if lat.get(u) else 9999, u)
+    merged = list(dict.fromkeys([u for u, _ in best] if best and isinstance(best[0], tuple)
+                                else list(best)))
+    with _POOL_LOCK:
+        out = list(dict.fromkeys(POOL_MANUAL + prev + merged))
+        out.sort(key=lambda u: ((_POOL_STATS.get(u) or {}).get("lat") or 9999))
+        _POOL[0] = out[:max(POOL_MAX, len(POOL_MANUAL))]
+
+
 def _pool_refresh(force=False):
+    """Cheap, synchronous: pull the source list, publish it, and (once per TTL)
+    kick the background trainer. Never blocks a user request on probing."""
     if not POOL_ON:
         return []
     now = time.time()
     with _POOL_LOCK:
-        if _POOL[0] and not force and now - _POOL_TS[0] < POOL_TTL:
+        fresh = now - _POOL_TS[0] < POOL_TTL
+        if _POOL[0] and not force and fresh:
             return list(_POOL[0])
+        if not force and fresh:
+            return []
         _POOL_TS[0] = now
-    urls = []
-    try:
-        r = requests.get(POOL_SRC, timeout=12, headers={"User-Agent": UA})
-        for ln in (r.text or "").splitlines():
-            ln = ln.strip()
-            if not ln or ln.startswith("#") or ":" not in ln:
-                continue
-            if "://" not in ln:
-                ln = "http://" + ln
-            # socks4/socks5 exits need PySocks; without it requests raises
-            # InvalidSchema, so every such exit looked "dead" (measured on prod:
-            # 40/40 exits were socks4 and the whole pool was unusable)
-            if ln.split("://")[0] not in ("http", "https"):
-                continue
-            urls.append(ln)
-    except Exception:
-        urls = []
-    urls = list(dict.fromkeys(urls))[:POOL_MAX]
-    with _POOL_LOCK:
-        if urls:
-            _POOL[0] = urls
+    cands = _pool_pull()
+    if not cands:
         return list(_POOL[0])
+    with _POOL_LOCK:
+        # publish untrained right away: a racing fetch can use these immediately
+        # while the trainer learns which are fast
+        keep = [u for u in _POOL[0] if _POOL_BAD.get(u, 0.0) <= now]
+        _POOL[0] = list(dict.fromkeys(POOL_MANUAL + keep + cands))[:POOL_CAND]
+    if not _TRAINING[0]:
+        _TRAINING[0] = True
+
+        def run():
+            try:
+                _pool_train(cands)
+            finally:
+                _TRAINING[0] = False
+        threading.Thread(target=run, daemon=True, name="pooltrain").start()
+    return list(_POOL[0])
+
+
+def _pool_score(u):
+    """quality x speed — a trained exit that is reliable AND fast wins."""
+    st = _POOL_STATS.get(u) or {}
+    ok, fail = st.get("ok", 0), st.get("fail", 0)
+    quality = (ok + 1.0) / (ok + fail + 2.0)
+    lat = st.get("lat") or 4000
+    return quality * (4000.0 / max(lat, 250.0))
 
 
 def _pool_order():
-    """Healthy exits, sticky-first, then most-successful first."""
+    """Healthy exits, sticky first (unless it is already busy), then best score."""
     now = time.time()
     urls = _pool_refresh()
     good = [u for u in urls if _POOL_BAD.get(u, 0.0) <= now]
     sticky = _STICKY[0] if _STICKY[1] > now else None
-    good.sort(key=lambda u: (0 if u == sticky else 1,
-                             -(_POOL_OK.get(u) or (0, 0))[0]))
+    if sticky and (sticky in good) and _STICKY_BUSY.get(sticky, 0) < 2:
+        rest = [u for u in good if u != sticky]
+        rest.sort(key=_pool_score, reverse=True)
+        return [sticky] + rest
+    good.sort(key=_pool_score, reverse=True)
     return good
 
 
-def _pool_note(u, ok, blocked=False):
+def _pool_note(u, ok, blocked=False, ms=None):
     now = time.time()
+    st = _POOL_STATS.setdefault(u, {"ok": 0, "fail": 0, "lat": None})
     if ok:
-        n = (_POOL_OK.get(u) or (0, 0))[0]
-        _POOL_OK[u] = (n + 1, now)
+        st["ok"] += 1
+        if ms:
+            st["lat"] = ms if st.get("lat") is None else int(0.6 * st["lat"] + 0.4 * ms)
         _POOL_BAD.pop(u, None)
         _STICKY[0], _STICKY[1] = u, now + 90
     else:
+        st["fail"] += 1
+        if blocked:
+            st["blocked"] = st.get("blocked", 0) + 1
         _POOL_BAD[u] = now + (900 if blocked else 300)
         if _STICKY[0] == u:
             _STICKY[1] = 0.0
@@ -534,10 +696,17 @@ def _pool_note(u, ok, blocked=False):
 
 def _pool_stats():
     now = time.time()
+    trained = [u for u in _POOL[0] if (_POOL_STATS.get(u) or {}).get("lat")]
+    lats = sorted((_POOL_STATS.get(u) or {}).get("lat") or 0 for u in trained)
     return {"pool": len(_POOL[0]),
             "healthy": len([u for u in _POOL[0] if _POOL_BAD.get(u, 0.0) <= now]),
+            "trained": len(trained),
+            "median_ms": lats[len(lats) // 2] if lats else None,
             "sticky": _STICKY[0] if _STICKY[1] > now else None,
-            "known_good": len(_POOL_OK),
+            "known_good": len([u for u, s in _POOL_STATS.items() if s.get("ok")]),
+            "manual": len(POOL_MANUAL),
+            "sources": len(POOL_SRCS),
+            "training": bool(_TRAINING[0]),
             "direct_blocked_hosts": [h for h, t in _DIRECT_BAD.items() if t > now],
             "enabled": POOL_ON}
 
@@ -592,11 +761,14 @@ def _pool_get(url, hd, timeout, stream=False):
         return None
 
     def one(u):
+        t0 = time.time()
+        _STICKY_BUSY[u] = _STICKY_BUSY.get(u, 0) + 1
         try:
             r = _S.get(url, headers=hd, timeout=timeout, stream=stream,
                        proxies={"http": u, "https": u})
         except Exception:
             _pool_note(u, False)
+            _STICKY_BUSY[u] = max(0, _STICKY_BUSY.get(u, 1) - 1)
             return None
         if r.status_code in (403, 503):
             try:
@@ -604,8 +776,10 @@ def _pool_get(url, hd, timeout, stream=False):
             except Exception:
                 pass
             _pool_note(u, False, blocked=True)     # this exit is flagged too
+            _STICKY_BUSY[u] = max(0, _STICKY_BUSY.get(u, 1) - 1)
             return None
-        _pool_note(u, True)
+        _pool_note(u, True, ms=int((time.time() - t0) * 1000))
+        _STICKY_BUSY[u] = max(0, _STICKY_BUSY.get(u, 1) - 1)
         return r
 
     if len(exits) == 1:
@@ -1517,7 +1691,9 @@ def format_card(kind, master_url, referer, server_label, info, page,
     else:
         hints["notWebReady"] = False
     card = {"name": name, "description": "\n".join(lines), "url": master_url,
-            "behaviorHints": hints}
+            "behaviorHints": hints,
+            # private build markers: read by apply_cfg(), stripped before sending
+            "_cdn": kind, "_res": res, "_tier": tier, "_nsubs": len(subs)}
     if subs:
         card["subtitles"] = subs
     return card
@@ -1662,6 +1838,19 @@ def _cards_from_matches(matched, years, ctype, se, ep, deadline):
 
 
 def _build_inner(ctype, imdb, se, ep, deadline):
+    if imdb.startswith("bpx-"):
+        # a catalog card the metadata providers never heard of: go straight to
+        # the watch page (no IMDb/TMDB hop exists for it anyway)
+        url = SITE + "/watch/" + imdb[4:] + ".html"
+        cards = _cards_from_matches([{"url": url}], [], ctype, se, ep, deadline)
+        if not cards:
+            return {"streams": [],
+                    "message": "matched %s but no playable/verified source "
+                               "(unsupported player or dead file)" % BRAND}
+        for i in range(1, len(cards)):
+            cards[i]["name"] += " · alt"
+        _STATS["cards"] += len(cards)
+        return {"streams": cards[:MAX_CARDS]}
     metas = resolve_meta_all(ctype, imdb)
     if not metas:
         return {"streams": [], "message": "no metadata for this id"}
@@ -1804,6 +1993,809 @@ def _prewarm_next(ctype, imdb, se, ep):
         pass
 
 
+# ═════════════════════════════════════ 13b. CATALOG · META · CONFIGURATION
+# Stremio's own catalogs never list Bangla regional titles and TMDB/IMDb are
+# missing a chunk of what BanglaPlex carries. So the addon browses the site
+# itself, and when IMDb/TMDB/Cinemeta have nothing for a card it falls back to
+# the SOURCE's own metadata (og:* tags + the cast/director/country/release
+# rows). No catalog item is ever an empty shell: each one either maps to a real
+# IMDb id or carries a `bpx:<slug>` id that this addon can BOTH stream and
+# describe.
+
+CFG_DEFAULTS = {
+    "n": MAX_CARDS,        # max cards per title
+    "subs": "en,hi,bn",    # subtitle language preference, or "off"
+    "q": "all",            # "all" | "1080" | "720"  (minimum resolution tier)
+    "cdn": "both",         # "both" | "tiktok" | "cf"  (server preference)
+    "cat": "all",          # "all" | "movie" | "series" | "off"
+    "tmdb": "",            # the user's OWN TMDB v3 key — never stored server-side
+}
+_CFG_TLS = threading.local()
+_Q_TIERS = {"all": 0, "720": 1, "1080": 2}
+_Q_RANK = {"4320p": 6, "2160p": 5, "1080p": 4, "720p": 3, "480p": 2, "360p": 1}
+
+
+def cfg_pack(cfg):
+    """config -> short URL-safe segment (only keys that differ from default)."""
+    slim = {}
+    for k, v in (cfg or {}).items():
+        if k in CFG_DEFAULTS and str(v) != str(CFG_DEFAULTS[k]):
+            slim[k] = v
+    if not slim:
+        return ""
+    raw = json.dumps(slim, separators=(",", ":"), sort_keys=True).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def cfg_unpack(seg):
+    """URL segment -> config dict, or None when it is not a config segment."""
+    cfg = dict(CFG_DEFAULTS)
+    if not seg:
+        return cfg
+    try:
+        slim = json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)).decode())
+        if not isinstance(slim, dict):
+            return None
+    except Exception:
+        return None
+    for k, v in slim.items():
+        if k not in CFG_DEFAULTS or not isinstance(v, (str, int, float)):
+            continue
+        v = str(v).strip()
+        if k == "n":
+            try:
+                cfg["n"] = max(1, min(MAX_CARDS, int(float(v))))
+            except Exception:
+                pass
+        elif k == "subs":
+            langs = [x.strip().lower() for x in v.split(",") if x.strip()]
+            cfg["subs"] = "off" if v.lower() == "off" else ",".join(langs[:6]) \
+                or CFG_DEFAULTS["subs"]
+        elif k in ("q", "cdn", "cat"):
+            allowed = {"q": _Q_TIERS, "cdn": ("both", "tiktok", "cf"),
+                       "cat": ("all", "movie", "series", "off")}[k]
+            if v.lower() in allowed:
+                cfg[k] = v.lower()
+        elif k == "tmdb":
+            if re.fullmatch(r"[A-Za-z0-9]{20,64}", v):
+                cfg["tmdb"] = v
+    return cfg
+
+
+def set_cfg(cfg):
+    _CFG_TLS.cfg = cfg or dict(CFG_DEFAULTS)
+
+
+def get_cfg():
+    return getattr(_CFG_TLS, "cfg", None) or CFG_DEFAULTS
+
+
+def apply_cfg(cards, cfg=None):
+    """Post-filter built cards by the requesting install's config, then strip the
+    private build markers. Filtering happens here (not inside the build) so the
+    shared cache stays config-independent and one build serves every config."""
+    cfg = cfg or get_cfg()
+    out = []
+    subs_want = None if (cfg.get("subs") or "").lower() == "off" else \
+        [x.strip().lower() for x in (cfg.get("subs") or "").split(",") if x.strip()]
+    minq = _Q_TIERS.get(cfg.get("q") or "all", 0)
+    cdn = (cfg.get("cdn") or "both").lower()
+    pool = []
+    for c in cards or []:
+        rank = _Q_RANK.get(c.get("_res") or "", 0)
+        # an UNMEASURED resolution (rank 0) is never dropped: the site sometimes
+        # labels a file "HDTC" with no playlist to measure, and hiding it would
+        # look exactly like a dead title
+        if minq and rank and rank < (4 if minq == 2 else 3):
+            continue                       # below the requested floor
+        pool.append(c)
+    if cdn == "tiktok" and pool:
+        pool = [c for c in pool if "tiktok" in (c.get("_cdn") or "").lower()] or pool
+    elif cdn == "cf" and pool:
+        pool = [c for c in pool if "tiktok" not in (c.get("_cdn") or "").lower()] or pool
+    for c in pool:
+        c = dict(c)
+        if subs_want is None:
+            c.pop("subtitles", None)
+        elif c.get("subtitles"):
+            order = {l: i for i, l in enumerate(subs_want)}
+            subs = sorted(c["subtitles"],
+                          key=lambda s: order.get((s.get("lang") or "").lower(), 99))
+            keep = [s for s in subs if (s.get("lang") or "").lower() in order] or subs
+            if keep:
+                c["subtitles"] = keep
+                c["description"] = re.sub(r"⟡ \d+ SUB", "⟡ %d SUB" % len(keep),
+                                          c.get("description") or "")
+            else:
+                c.pop("subtitles", None)
+        for k in ("_cdn", "_res", "_tier", "_nsubs"):
+            c.pop(k, None)
+        out.append(c)
+    return out[:max(1, int(cfg.get("n") or MAX_CARDS))]
+
+
+# ── site listing parse ───────────────────────────────────────────────────────
+_CARD_SPLIT = 'class="col-md-2 col-sm-3 col-xs-6"'
+_LIST_TTL = 45 * 60
+_IMDB_TTL = 24 * 3600
+_META_RES_TTL = 12 * 3600
+_PAGE_N = 24                                  # the site's own page size
+
+
+def parse_listing(h):
+    """OVOO card grid -> [{slug,url,title,poster,year,quality,series,rating}].
+
+    Splitting on the card container and running small regexes per card is far
+    sturdier than one big multi-line pattern: the grid mixes trending badges,
+    lazy background-images and TV labels in varying order."""
+    out, seen = [], set()
+    for chunk in (h or "").split(_CARD_SPLIT)[1:]:
+        m = re.search(r"/watch/([a-z0-9\-_.]+?)\.html", chunk)
+        if not m:
+            continue
+        slug = m.group(1)
+        if slug in seen:
+            continue
+        tm = re.search(r'class="movie-title">\s*<h3>\s*<a[^>]*>([^<]{1,160})</a>', chunk)
+        if not tm:
+            tm = re.search(r'<a[^>]+href="[^"]*/watch/[^"]+"[^>]*>([^<]{3,160})</a>', chunk)
+        title = _html.unescape(tm.group(1)).strip() if tm else slug.replace("-", " ").title()
+        pm = re.search(r"background-image:\s*url\('([^']+)'\)", chunk) or \
+            re.search(r'<img[^>]+src="([^"]+)"', chunk)
+        ym = re.search(r'label-year">\s*((?:19|20)\d{2})', chunk)
+        qm = re.search(r'label-primary">\s*([^<]{1,20}?)\s*<', chunk)
+        rm = re.search(r'IMDB\s*([\d.]+)', chunk)
+        seen.add(slug)
+        out.append({
+            "slug": slug,
+            "url": SITE + "/watch/" + slug + ".html",
+            "title": title,
+            "poster": _html.unescape(pm.group(1)).strip() if pm else "",
+            "year": int(ym.group(1)) if ym else None,
+            "quality": _html.unescape(qm.group(1)).strip() if qm else "",
+            "series": "label-tvseries" in chunk,
+            "rating": float(rm.group(1)) if rm and rm.group(1) not in ("0", "0.0") else 0.0,
+            "trending": "video_trending_badge" in chunk,
+        })
+    return out
+
+
+_LIST_STALE = {}          # url -> (usable_until, items)
+_LIST_REFRESH = set()
+_LIST_STALE_TTL = 12 * 3600
+
+
+def _list_revalidate(url, timeout):
+    try:
+        r = _get(url, timeout=timeout, referer=SITE + "/")
+        if r is not None and r.status_code == 200:
+            items = parse_listing(r.text or "")
+            if items:
+                C_LIST.put(url, items, _LIST_TTL)
+                _LIST_STALE[url] = (time.time() + _LIST_STALE_TTL, items)
+    except Exception:
+        pass
+    finally:
+        _LIST_REFRESH.discard(url)
+
+
+def list_page(url, timeout=18):
+    """fetch + parse one listing page (cached parsed, never the raw HTML).
+
+    Stale-while-revalidate: the homepage is ~375 KB and, from a Cloudflare-flagged
+    egress, has to ride a free exit (measured ~9 s). Nobody should stare at a
+    spinner for that when yesterday's shelf is still perfectly good — serve the
+    stale page and refresh it in the background."""
+    hit, val = C_LIST.get(url)
+    if hit:
+        return val
+    st = _LIST_STALE.get(url)
+    if st and st[0] > time.time() and st[1] and url not in _LIST_REFRESH:
+        _LIST_REFRESH.add(url)
+        threading.Thread(target=_list_revalidate, args=(url, timeout),
+                         daemon=True, name="listswr").start()
+        return st[1]
+    r = _get(url, timeout=timeout, referer=SITE + "/")
+    if r is None:
+        return None                                    # transient: cache nothing
+    items = parse_listing(r.text or "")
+    if items:
+        C_LIST.put(url, items, _LIST_TTL)
+        _LIST_STALE[url] = (time.time() + _LIST_STALE_TTL, items)
+    else:
+        C_LIST.put(url, [], _NEG_TTL)                  # honest empty page
+    return items
+
+
+def catalog_prewarm():
+    """Warm the three default shelves at boot so the first user does not pay for
+    a 375 KB proxied fetch (and so the proxy pool gets trained early)."""
+    for ctype, cat_id in (("movie", "bpx-latest"), ("movie", "bpx-year"),
+                          ("series", "bpx-series")):
+        try:
+            catalog_items(ctype, cat_id)
+        except Exception:
+            pass
+
+
+def _slugify(s):
+    return re.sub(r"[^a-z0-9\-]+", "", (s or "").lower().strip())[:60]
+
+
+MOVIE_GENRES = ["bengali-movies", "bollywood-movies", "hollywood-movies",
+                "south-indian-movies", "dual-audio-movies", "chinese-movies",
+                "japanese-movies", "korean-movies", "indonesia-movie", "action",
+                "comedy", "crime", "drama", "family", "fantasy", "history",
+                "horror", "thriller", "western", "documentary", "kids"]
+SERIES_GENRES = ["bengali-web-series", "hollywood-web-series", "bollywood-series",
+                 "korean-web-series", "japanese-series", "dual-audio-series"]
+_THIS_YEAR = time.localtime().tm_year
+
+CAT_DEFS = [
+    {"type": "movie", "id": "bpx-latest", "name": "%s · Latest" % BRAND,
+     "extra": [{"name": "search", "isRequired": False},
+               {"name": "genre", "isRequired": False, "options": MOVIE_GENRES},
+               {"name": "skip", "isRequired": False}]},
+    {"type": "movie", "id": "bpx-year", "name": "%s · %d" % (BRAND, _THIS_YEAR),
+     "extra": [{"name": "search", "isRequired": False},
+               {"name": "skip", "isRequired": False}]},
+    {"type": "series", "id": "bpx-series", "name": "%s · Series" % BRAND,
+     "extra": [{"name": "search", "isRequired": False},
+               {"name": "genre", "isRequired": False, "options": SERIES_GENRES},
+               {"name": "skip", "isRequired": False}]},
+]
+CAT_IDS = {(c["type"], c["id"]) for c in CAT_DEFS}
+MANIFEST["catalogs"] = CAT_DEFS          # MANIFEST is defined in section 1
+
+
+def catalog_source(cat_id, ctype, genre, skip):
+    """(url, mode) for one catalog page. Pagination on this site is PATH-based
+    (`/genre/action/24.html` = offset 24) — `?page=` is silently ignored."""
+    skip = max(0, int(skip or 0))
+    off = (skip // _PAGE_N) * _PAGE_N
+    g = _slugify(genre)
+    if g:
+        return (SITE + ("/genre/%s.html" % g if not off else "/genre/%s/%d.html" % (g, off)),
+                "page")
+    if cat_id == "bpx-year":
+        y = _THIS_YEAR
+        return (SITE + ("/year/%d.html" % y if not off else "/year/%d/%d.html" % (y, off)),
+                "page")
+    if cat_id == "bpx-series":
+        g = "bengali-web-series"
+        return (SITE + ("/genre/%s.html" % g if not off else "/genre/%s/%d.html" % (g, off)),
+                "page")
+    return SITE + "/", "home"
+
+
+def imdb_suggest_title(title, year=None, ctype="movie"):
+    """title -> IMDb id, or None. Strict on purpose: a wrong tt id would make
+    Stremio show a DIFFERENT film's poster/synopsis, which is worse than no
+    mapping at all (then the source metadata serves the card)."""
+    q = re.sub(r"\s+", "_", re.sub(r"[^a-z0-9 ]", "", (title or "").lower()).strip())
+    if len(q) < 2:
+        return None
+    key = ("sg", q, year or 0, ctype)
+    hit, val = C_IMDB.get(key)
+    if hit:
+        return val or None
+    out = None
+    try:
+        r = _S.get("https://v2.sg.media-imdb.com/suggestion/%s/%s.json" % (q[0], q),
+                   timeout=7, headers={"User-Agent": UA})
+        arr = (r.json() or {}).get("d") if r.status_code == 200 else None
+    except Exception:
+        arr = None
+    if isinstance(arr, list):
+        nt = _norm_title(title)
+        want = {"movie": ("movie", "tvmovie", "video"),
+                "series": ("tvseries", "tvmovie", "tvminiseries")}.get(ctype, ())
+        for it in arr[:8]:
+            iid = it.get("id") or ""
+            if not iid.startswith("tt"):
+                continue
+            l = _norm_title(it.get("l"))
+            if not l or not nt:
+                continue
+            same = (l == nt) or (len(l) >= 4 and len(nt) >= 4 and (l in nt or nt in l))
+            if not same:
+                continue
+            qid = (it.get("qid") or "").lower()
+            if qid and want and qid not in want:
+                continue
+            y = it.get("y")
+            if year and y and abs(int(y) - int(year)) > 1:
+                continue
+            out = iid
+            break
+    C_IMDB.put(key, out or "", _IMDB_TTL)
+    return out
+
+
+def _map_ids(items, ctype, budget=14.0):
+    """site cards -> Stremio ids, in bounded parallel waves (24 suggest calls at
+    once gets 429s). Unmapped items keep a routable bpx:<slug> id."""
+    ddl = time.time() + budget
+    todo = [it for it in items if not it.get("id")]
+    futs = {}
+    for it in todo:
+        if time.time() >= ddl:
+            break
+        futs[_IO_EX.submit(imdb_suggest_title, it["title"], it.get("year"), ctype)] = it
+    for f in as_completed(futs):
+        it = futs[f]
+        try:
+            tt = f.result(timeout=max(0.2, ddl - time.time()))
+        except Exception:
+            tt = None
+        it["id"] = tt or ("bpx-" + it["slug"])
+    for it in items:
+        if not it.get("id"):
+            it["id"] = "bpx-" + it["slug"]
+    return items
+
+
+def catalog_items(ctype, cat_id, genre=None, search=None, skip=0, cfg=None):
+    """one catalog page -> Stremio meta previews (never empty shells)."""
+    cfg = cfg or get_cfg()
+    skip = max(0, int(skip or 0))
+    ck = (ctype, cat_id, _slugify(genre), (search or "").strip().lower(), skip,
+          cfg.get("tmdb") or "")
+    hit, val = C_LIST.get(("cat", ck))
+    if hit:
+        return val
+    if (search or "").strip():
+        cands = _search_autocomplete(search.strip())
+        if cands is None:
+            return []                        # transient: empty now, retry later
+        items = []
+        for c in cands[:_PAGE_N * 2]:
+            slug = urlparse(c["url"]).path.split("/watch/")[-1].replace(".html", "")
+            is_series = "series" in (c.get("type") or "").lower() or "tv" in (c.get("type") or "").lower()
+            if ctype == "series" and not is_series:
+                continue
+            if ctype == "movie" and is_series:
+                continue
+            items.append({"slug": slug, "url": c["url"], "title": c["title"],
+                          "poster": c.get("image") or "", "year": _year_of(c["title"]),
+                          "quality": "", "series": is_series, "rating": 0.0})
+        items = items[:_PAGE_N]
+    else:
+        url, mode = catalog_source(cat_id, ctype, genre, skip)
+        got = list_page(url)
+        if got is None:
+            return []
+        if mode == "home":
+            got = [c for c in got if c["series"] == (ctype == "series")]
+            items = got[skip:skip + _PAGE_N]        # the homepage is one big page
+        else:
+            items = [c for c in got if (ctype == "series") == c["series"]] or \
+                    (got if ctype == "series" else got)
+            items = items[:_PAGE_N]
+    if not items:
+        C_LIST.put(("cat", ck), [], _NEG_TTL)
+        return []
+    items = [dict(it) for it in items]
+    _map_ids(items, ctype)
+    metas = []
+    for it in items:
+        m = {"id": it["id"], "type": ctype, "name": it["title"],
+             "posterShape": "poster"}
+        if it.get("poster"):
+            m["poster"] = it["poster"]
+        if it.get("year"):
+            m["year"] = it["year"]
+        if it.get("rating"):
+            m["imdbRating"] = "%.1f" % it["rating"]
+        bits = [b for b in (it.get("quality") or "", "TRENDING" if it.get("trending") else "")
+                if b]
+        if bits:
+            m["description"] = " · ".join(bits)
+        if it["id"].startswith("bpx-"):
+            m["bpxSource"] = it["url"]
+        metas.append(m)
+    C_LIST.put(("cat", ck), metas, _LIST_TTL)
+    return metas
+
+
+# ── meta: providers first, SOURCE fallback second ────────────────────────────
+def _cinemeta_full(ctype, imdb):
+    hit, val = C_META.get(("cmf", ctype, imdb))
+    if hit:
+        return val
+    out = None
+    try:
+        r = _S.get("%s/meta/%s/%s.json" % (CINEMETA, ctype, imdb), timeout=8)
+        if r.status_code == 200:
+            m = (r.json() or {}).get("meta")
+            if isinstance(m, dict) and m.get("name"):
+                out = m
+    except Exception:
+        out = None
+    C_META.put(("cmf", ctype, imdb), out, _META_TTL if out else _NEG_TTL)
+    return out
+
+
+def _tmdb_full(ctype, imdb, key=None):
+    key = key or TMDB_KEY
+    if not key:
+        return None
+    hit, val = C_META.get(("tmf", ctype, imdb, key[-4:]))
+    if hit:
+        return val
+    out = None
+    try:
+        r = _S.get("https://api.themoviedb.org/3/find/%s?external_source=imdb_id"
+                   "&api_key=%s" % (imdb, key), timeout=8)
+        j = r.json() if r.status_code == 200 else {}
+        res = (j.get("movie_results") or j.get("tv_results") or [None])[0]
+        if res:
+            kind = "movie" if j.get("movie_results") else "tv"
+            r2 = _S.get("https://api.themoviedb.org/3/%s/%s?api_key=%s"
+                        "&append_to_response=external_ids,credits" % (kind, res["id"], key),
+                        timeout=8)
+            d = r2.json() if r2.status_code == 200 else {}
+            if d:
+                cast = [c.get("name") for c in ((d.get("credits") or {}).get("cast") or [])[:12]]
+                crew = (d.get("credits") or {}).get("crew") or []
+                out = {
+                    "name": d.get("title") or d.get("name"),
+                    "poster": ("https://image.tmdb.org/t/p/w500" + d["poster_path"])
+                              if d.get("poster_path") else "",
+                    "background": ("https://image.tmdb.org/t/p/w1280" + d["backdrop_path"])
+                                  if d.get("backdrop_path") else "",
+                    "description": d.get("overview") or "",
+                    "year": _year_of(d.get("release_date") or d.get("first_air_date") or ""),
+                    "genres": [g.get("name") for g in (d.get("genres") or [])],
+                    "cast": [c for c in cast if c],
+                    "director": next((c.get("name") for c in crew
+                                      if c.get("job") == "Director"), ""),
+                    "runtime": ("%d min" % d["runtime"]) if d.get("runtime") else "",
+                    "imdbRating": ("%.1f" % d["vote_average"]) if d.get("vote_average") else "",
+                    "releaseInfo": (d.get("release_date") or d.get("first_air_date") or "")[:4],
+                }
+    except Exception:
+        out = None
+    C_META.put(("tmf", ctype, imdb, key[-4:]), out, _META_TTL if out else _NEG_TTL)
+    return out
+
+
+def meta_from_page(page, ctype, imdb=None):
+    """SOURCE metadata: everything the watch page knows. This is the fallback
+    for titles TMDB/IMDb/Cinemeta never heard of (most Bangla regional ones)."""
+    if not page:
+        return None
+    title = page.get("title") or ""
+    m = {"id": imdb or ("bpx-" + page.get("slug", "")), "type": ctype,
+         "name": title, "posterShape": "square" if ctype == "series" else "poster"}
+    if page.get("poster"):
+        m["poster"] = page["poster"]
+        m["background"] = page["poster"]
+    if page.get("plot"):
+        m["description"] = page["plot"]
+    if page.get("year"):
+        m["year"] = int(page["year"])
+        m["releaseInfo"] = str(page["year"])
+    if page.get("release"):
+        m["released"] = page["release"]
+    if page.get("duration"):
+        m["runtime"] = _fmt_dur(page["duration"])
+    for src, dst in (("genre", "genres"), ("country", "country"),
+                     ("actors", "cast"), ("director", "director"),
+                     ("quality", "quality")):
+        v = page.get(src)
+        if not v:
+            continue
+        if dst == "genres":
+            m["genres"] = [g.strip() for g in re.split(r"[,|]", v) if g.strip()][:10]
+        elif dst == "cast":
+            m["cast"] = [a.strip() for a in re.split(r"[,|]", v) if a.strip()][:12]
+        else:
+            m[dst] = v.strip()
+    if page.get("slug"):
+        m["bpxSlug"] = page["slug"]
+    return m
+
+
+def _needs_site(meta):
+    """True when the providers left a visible hole the source can fill."""
+    if not meta:
+        return True
+    return not (meta.get("poster") and meta.get("description"))
+
+
+def _site_meta_for(ctype, title, year=None, slug=None):
+    """source-side meta by slug, or by a site search when we only have a title."""
+    if slug:
+        return meta_from_page(parse_watch_page(SITE + "/watch/%s.html" % slug), ctype)
+    if not title:
+        return None
+    cands = search_candidates(re.sub(r"\s*\((?:19|20)\d{2}\)\s*$", "", title).strip())
+    if not cands:
+        return None
+    matched = match_candidates(cands, title, year, ctype) or cands[:1]
+    return meta_from_page(parse_watch_page(matched[0]["url"]), ctype)
+
+
+def build_meta(ctype, mid, cfg=None):
+    """Providers race first; the SOURCE fills whatever they don't have."""
+    cfg = cfg or get_cfg()
+    ck = (ctype, mid, (cfg.get("tmdb") or "")[-4:])
+    hit, val = C_METARES.get(ck)
+    if hit:
+        return val
+    meta = None
+    if mid.startswith("tt"):
+        futs = [_IO_EX.submit(_cinemeta_full, ctype, mid)]
+        key = cfg.get("tmdb") or TMDB_KEY
+        if key:
+            futs.append(_IO_EX.submit(_tmdb_full, ctype, mid, key))
+        for f in as_completed(futs, timeout=10):
+            try:
+                got = f.result(timeout=0)
+            except Exception:
+                got = None
+            if got and (meta is None or (not meta.get("poster") and got.get("poster"))):
+                base = dict(got)
+                if meta:
+                    for k, v in meta.items():
+                        if v and not base.get(k):
+                            base[k] = v
+                meta = base
+            if meta and not _needs_site(meta):
+                break
+        if _needs_site(meta):
+            site = _site_meta_for(ctype, (meta or {}).get("name") or "",
+                                  _year_of((meta or {}).get("releaseInfo") or
+                                           str((meta or {}).get("year") or "")))
+            if site:
+                meta = _merge_meta(meta, site)
+        if meta:
+            meta["id"], meta["type"] = mid, ctype
+    elif mid.startswith("bpx-"):
+        meta = _site_meta_for(ctype, "", slug=mid[4:])
+    if meta:
+        meta = normalize_meta(meta)
+        C_METARES.put(ck, meta, _META_RES_TTL)
+    return meta
+
+
+def normalize_meta(m):
+    """One shape for every source: providers and the site disagree about types
+    (Cinemeta sends `director` as a list and no `year`, only `releaseInfo`; the
+    site sends comma strings). Stremio renders whatever it gets, so an unshaped
+    field shows up as a blank line on the detail page."""
+    if not m:
+        return m
+    out = dict(m)
+    y = out.get("year") or _year_of(str(out.get("releaseInfo") or ""))
+    if y:
+        out["year"] = int(y)
+        out.setdefault("releaseInfo", str(y))
+    for k in ("director", "country", "language", "quality"):
+        v = out.get(k)
+        if isinstance(v, (list, tuple)):
+            out[k] = ", ".join(str(x).strip() for x in v if x)
+        elif isinstance(v, str):
+            out[k] = re.sub(r"\s*,\s*", ", ", v).strip(" ,")
+    for k in ("cast", "genres"):
+        v = out.get(k)
+        if isinstance(v, str):
+            out[k] = [x.strip() for x in re.split(r"[,|]", v) if x.strip()]
+        elif isinstance(v, (list, tuple)):
+            out[k] = [str(x).strip() for x in v if x]
+    if isinstance(out.get("cast"), list):
+        out["cast"] = out["cast"][:20]
+    if isinstance(out.get("description"), str):
+        out["description"] = re.sub(r"\s+", " ", out["description"]).strip()
+    return {k: v for k, v in out.items() if v not in ("", [], None, {})}
+
+
+def _merge_meta(base, fill):
+    """provider meta wins field-by-field; the source only fills holes."""
+    out = dict(base or {})
+    for k, v in (fill or {}).items():
+        if not v or out.get(k):
+            continue
+        out[k] = v
+    if (base or {}).get("name") and not out.get("name"):
+        out["name"] = base["name"]
+    return out
+
+
+def validate_tmdb_key(key):
+    if not re.fullmatch(r"[A-Za-z0-9]{20,64}", (key or "").strip()):
+        return False
+    try:
+        r = _S.get("https://api.themoviedb.org/3/configuration?api_key=%s"
+                   % key.strip(), timeout=8)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+CONFIG_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__NAME__ — Configure</title>
+<style>
+:root{--bg:#0a0a0b;--card:#16161a;--line:#2a2a30;--tx:#fff;--mut:#9aa0a8;--acc:#ff277d}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);
+color:var(--tx);line-height:1.5;padding:26px 14px 60px}
+.wrap{max-width:620px;margin:0 auto}
+h1{font-size:27px;letter-spacing:-.4px}
+.v{color:var(--mut);font-size:13px;font-weight:400;margin-left:8px}
+.tag{color:var(--mut);margin:2px 0 20px;font-size:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+padding:18px;margin:14px 0}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:var(--mut);
+margin-bottom:12px;font-weight:600}
+.row{display:flex;align-items:center;justify-content:space-between;gap:14px;
+padding:9px 0;border-top:1px solid #1f1f26}
+.row:first-of-type{border-top:0}
+.row label{font-size:14px}
+.row .hint{display:block;color:var(--mut);font-size:12px;margin-top:2px}
+select,input[type=text]{background:#0a0a0b;color:#fff;border:1px solid var(--line);
+border-radius:9px;padding:9px 11px;font-size:14px;outline:none;min-width:150px}
+select:focus,input[type=text]:focus{border-color:var(--acc)}
+.chips{display:flex;flex-wrap:wrap;gap:7px}
+.chip{border:1px solid var(--line);background:#0a0a0b;color:var(--mut);border-radius:20px;
+padding:6px 12px;font-size:13px;cursor:pointer;user-select:none}
+.chip.on{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+.btn{display:block;width:100%;background:var(--acc);color:#fff;border:0;border-radius:11px;
+padding:14px;font-size:16px;font-weight:700;cursor:pointer;text-align:center;
+text-decoration:none}
+.btn:hover{background:#e0106a}
+.btn.ghost{background:#22222a;color:#cfd3d8}
+.url{width:100%;background:#0a0a0b;border:1px solid var(--line);color:#4ade80;
+border-radius:9px;padding:10px;font-family:ui-monospace,Menlo,monospace;font-size:11.5px;
+word-break:break-all;margin-top:10px}
+.msg{margin-top:10px;padding:10px;border-radius:9px;font-size:13px;display:none}
+.msg.ok{display:block;background:#0d2818;border:1px solid #1a5c2e;color:#4ade80}
+.msg.err{display:block;background:#2d0a0a;border:1px solid #5c1a1a;color:#f87171}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.small{color:var(--mut);font-size:12.5px}
+.badges span{display:inline-block;background:#22222a;border:1px solid var(--line);
+color:#cfd3d8;padding:3px 10px;border-radius:12px;font-size:11.5px;margin:0 4px 6px 0}
+a{color:var(--acc)}
+</style></head><body><div class="wrap">
+<h1>🎬 __NAME__<span class="v">v__VERSION__</span></h1>
+<p class="tag">Bangla · Hindi · Hollywood movies &amp; web-series from BanglaPlex —
+direct CDN streams, own catalogs, zero server bandwidth.</p>
+<div class="badges"><span>📺 Catalogs</span><span>⚡ Direct CDN</span><span>💬 Multi-lang subs</span>
+<span>🛡️ Proxy pool</span><span>0 bytes relayed</span></div>
+
+<div class="card"><h2>Playback</h2>
+<div class="row"><div><label>Stream cards per title</label>
+<span class="hint">Different CDN / server for the same file</span></div>
+<select id="n"></select></div>
+<div class="row"><div><label>Minimum quality</label>
+<span class="hint">Cards below this are dropped</span></div>
+<select id="q"><option value="all">Everything</option>
+<option value="720">720p and up</option><option value="1080">1080p only</option></select></div>
+<div class="row"><div><label>Preferred server</label>
+<span class="hint">TikTok-CDN needs no headers; Cloudflare needs a Referer</span></div>
+<select id="cdn"><option value="both">Both</option>
+<option value="tiktok">TikTok CDN first only</option>
+<option value="cf">Cloudflare only</option></select></div>
+<div class="row"><div><label>Subtitles</label>
+<span class="hint">Tap languages to reorder — leftmost wins</span></div>
+<div class="chips" id="subs"></div></div>
+</div>
+
+<div class="card"><h2>Catalogs</h2>
+<div class="row"><div><label>BanglaPlex shelves in your board</label>
+<span class="hint">Latest · this year · Series (with genre + search filters)</span></div>
+<select id="cat"><option value="all">Movies + Series</option>
+<option value="movie">Movies only</option><option value="series">Series only</option>
+<option value="off">No catalogs (streams only)</option></select></div>
+</div>
+
+<div class="card"><h2>TMDb key (optional)</h2>
+<div class="row"><div><label>Your own API key</label>
+<span class="hint">Used only for richer posters/synopses. Never stored — it lives in
+your install URL. Free at <a href="https://www.themoviedb.org/settings/api"
+target="_blank" rel="noopener">themoviedb.org</a>. Without it IMDb + Cinemeta +
+the BanglaPlex source itself still cover every card.</span></div>
+<div style="min-width:190px"><input type="text" id="tmdb" placeholder="32-char key"
+autocomplete="off" spellcheck="false" style="width:100%">
+<button class="btn ghost" style="margin-top:8px;padding:9px" onclick="checkKey()">Check key</button></div></div>
+<div class="msg" id="kmsg"></div>
+</div>
+
+<div class="card"><h2>Install</h2>
+<a class="btn" id="go" href="#">Install in Stremio</a>
+<div class="two"><button class="btn ghost" onclick="copyUrl()">Copy URL</button>
+<button class="btn ghost" onclick="resetAll()">Reset</button></div>
+<input class="url" id="iu" readonly onclick="this.select()">
+<div class="msg" id="msg"></div>
+<p class="small" style="margin-top:12px">Manifest: <a id="mlink" href="#">__BASE__/manifest.json</a>
+· <a href="/health">health</a> · <a href="/">about</a></p>
+</div>
+<p class="small" style="text-align:center;margin-top:18px">__BASE__ · v__VERSION__ ·
+config travels inside the install URL, nothing is stored on the server</p>
+</div>
+<script>
+const BASE=location.origin, DEF=__DEF__;
+let CFG=Object.assign({},DEF,__CFG__), NMAX=__NMAX__;
+const LANGS=[["en","English"],["hi","Hindi"],["bn","Bangla"],["ta","Tamil"],
+["te","Telugu"],["ko","Korean"],["ja","Japanese"],["ar","Arabic"],["id","Indonesian"]];
+
+function buildUI(){
+  const n=document.getElementById("n"); n.innerHTML="";
+  for(let i=1;i<=NMAX;i++){const o=document.createElement("option");
+    o.value=i;o.textContent=i+(i===1?" card":" cards");n.appendChild(o);}
+  n.value=CFG.n; n.onchange=()=>{CFG.n=parseInt(n.value);render();};
+  for(const k of ["q","cdn","cat"]){
+    const el=document.getElementById(k); el.value=CFG[k];
+    el.onchange=()=>{CFG[k]=el.value;render();};
+  }
+  document.getElementById("tmdb").value=CFG.tmdb||"";
+  document.getElementById("tmdb").oninput=e=>{CFG.tmdb=e.target.value.trim();render();};
+  const box=document.getElementById("subs"); box.innerHTML="";
+  const off=document.createElement("span");
+  off.className="chip"+(CFG.subs==="off"?" on":""); off.textContent="None";
+  off.onclick=()=>{CFG.subs=CFG.subs==="off"?"en,hi,bn":"off";buildUI();render();};
+  box.appendChild(off);
+  cur=(CFG.subs==="off"?[]:CFG.subs.split(",").filter(Boolean));
+  for(const [code,name] of LANGS){
+    const c=document.createElement("span");
+    const on=cur.includes(code); c.className="chip"+(on?" on":""); c.textContent=name;
+    c.onclick=()=>{
+      if(CFG.subs==="off")CFG.subs="";
+      let l=CFG.subs.split(",").filter(Boolean);
+      if(l.includes(code)) l=l.filter(x=>x!==code); else l.push(code);
+      CFG.subs=l.join(",")||"off"; buildUI(); render();
+    };
+    box.appendChild(c);
+  }
+}
+function pack(cfg){
+  const slim={};
+  for(const k of Object.keys(cfg).sort()){
+    if(String(cfg[k])===String(DEF[k]))continue;
+    slim[k]=(k==="n")?parseInt(cfg[k]):String(cfg[k]);
+  }
+  if(!Object.keys(slim).length)return "";
+  return btoa(unescape(encodeURIComponent(JSON.stringify(slim))))
+    .replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/,"");
+}
+function render(){
+  const seg=pack(CFG);
+  const url=BASE+(seg?"/"+seg:"")+"/manifest.json";
+  document.getElementById("iu").value=url;
+  document.getElementById("mlink").href=url;
+  document.getElementById("mlink").textContent=url;
+  const g=document.getElementById("go");
+  g.href="stremio://"+url.replace(/^https?:\\/\\//,"");
+}
+function flash(id,txt,ok){const e=document.getElementById(id);
+  e.className="msg "+(ok?"ok":"err");e.textContent=txt;}
+async function checkKey(){
+  const k=document.getElementById("tmdb").value.trim();
+  if(!k){flash("kmsg","No key entered — that is fine, it is optional.",true);return;}
+  flash("kmsg","Checking…",true);
+  try{
+    const r=await fetch("/validate-key?key="+encodeURIComponent(k));
+    const d=await r.json();
+    flash("kmsg",d.valid?"✓ Key works — TMDb art enabled.":"✗ TMDb rejected that key.",!!d.valid);
+  }catch(e){flash("kmsg","✗ Could not reach the validator.",false);}
+}
+function copyUrl(){
+  const i=document.getElementById("iu"); i.select(); i.setSelectionRange(0,1e5);
+  navigator.clipboard?.writeText(i.value);
+  flash("msg","Install URL copied — paste it into Stremio ▸ Addons ▸ paste link.",true);
+}
+function resetAll(){CFG=Object.assign({},DEF);buildUI();render();
+  flash("msg","Back to defaults.",true);}
+const qp=new URLSearchParams(location.search).get("c");
+if(qp){try{
+  const slim=JSON.parse(decodeURIComponent(escape(atob(qp.replace(/-/g,"+").replace(/_/g,"/")))));
+  CFG=Object.assign({},DEF,slim);}catch(e){}}
+buildUI();render();
+</script></body></html>"""
+
+
 # ══════════════════════════════════════════════════════════ 14. LANDING PAGE
 LANDING = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1824,10 +2816,15 @@ ul{padding-left:20px}li{margin:6px 0}
 <h1>__NAME__ <span class="small">v__VERSION__</span></h1>
 <p class="sub">⚡ Stream-only Stremio addon for BanglaPlex — Bangla / Hindi /
 Hollywood movies &amp; web-series. Zero-bandwidth: media flows CDN → your player.</p>
-<p><a class="btn" href="stremio:///install?addOnUrl=__BASE__/manifest.json">Install in Stremio</a></p>
+<p><a class="btn" href="/configure">⚙️ Configure &amp; install</a>
+&nbsp;<a class="btn" style="background:#22222a" href="stremio:///install?addOnUrl=__BASE__/manifest.json">Quick install (defaults)</a></p>
 <div class="card"><b>Install URL</b><br><code>__BASE__/manifest.json</code>
-<p class="small">Open any movie/series from your own catalogs (IMDb, Trakt, Cinemeta…) —
-this addon answers with direct streams. No catalogs of its own.</p></div>
+<p class="small">Works two ways: browse BanglaPlex&#39;s own shelves
+(<b>Latest</b>, <b>this year</b>, <b>Series</b> — with genre + search filters), or open
+any title from your existing catalogs (Cinemeta, IMDb, Trakt) and this addon answers
+with direct streams. Cards per title, minimum quality, server preference, subtitle
+languages and catalog visibility are all configurable — the config travels inside your
+install URL and nothing is stored server-side.</p></div>
 <div class="card"><b>What it does</b><ul>
 <li>Searches BanglaPlex, matches title+year, picks the right video file
 (season / episode-pack aware).</li>
@@ -1843,6 +2840,11 @@ second) + multi-language VTT subtitles.</li>
 
 # ═══════════════════════════════════════════════════════════ 15. HTTP SERVER
 _STREAM_RE = re.compile(r"^/stream/(movie|series)/([^/]+)\.json$")
+_CAT_RE = re.compile(r"^/catalog/(movie|series)/([A-Za-z0-9_\-.]+)(?:/([^/]*))?\.json$")
+_META_RE = re.compile(r"^/meta/(movie|series)/([^/]+)\.json$")
+_TOP_ROUTES = {"stream", "catalog", "meta", "subtitles", "health", "manifest.json",
+               "configure", "config", "debug", "validate-key", "install",
+               "index.html", "favicon.ico"}
 # players call both /subtitles/{type}/{id}.json and the sdk-style
 # /subtitles/{type}/{id}/{extra}.json — accept either
 _SUBS_RE = re.compile(r"^/subtitles/(movie|series)/([^/]+?)(?:/[^/]*)?\.json$")
@@ -1867,6 +2869,19 @@ def _split_id(ctype, raw):
         except ValueError:
             se = ep = None
     return imdb, se, ep
+
+
+def _path_extras(tail):
+    """Stremio also encodes catalog extras in the path segment:
+    /catalog/movie/id/genre=action&skip=24.json  (also ';' or ',' separated)"""
+    out = {}
+    for chunk in re.split(r"[&;,]", unquote(tail or "")):
+        if "=" in chunk:
+            k, v = chunk.split("=", 1)
+            k, v = k.strip().lower(), v.strip()
+            if k:
+                out[k] = v
+    return out
 
 
 def _absolutize(cards, base):
@@ -1921,17 +2936,33 @@ class Handler(BaseHTTPRequestHandler):
         t0 = time.time()
         parsed = urlparse(self.path)
         path = parsed.path
+        if parsed.params:
+            # urlparse peels ";skip=24" off the last segment as RFC-1738 params —
+            # Stremio's path-style catalog extras use exactly that separator
+            path = path + ";" + parsed.params
         q = parse_qs(parsed.query)
         base = _public_base(self)
         if not _PUBLIC_BASE[0] and self.headers.get("Host"):
             _PUBLIC_BASE[0] = base
+        # Stremio carries per-install config as the first path segment
+        segs = [s for s in path.split("/") if s]
+        if segs and segs[0] not in _TOP_ROUTES:
+            cfg = cfg_unpack(segs[0])
+            if cfg is None:
+                return self._send(404, {"error": "unknown path or bad config"})
+            path = "/" + "/".join(segs[1:]) if len(segs) > 1 else "/"
+            base = base + "/" + segs[0]
+        else:
+            cfg = dict(CFG_DEFAULTS)
+        set_cfg(cfg)
         try:
-            self._route(path, q, base, t0)
+            self._route(path, q, base, t0, cfg)
         except Exception as e:
             self._send(500, {"error": "internal", "detail": str(e)[:120]})
 
     # ─────────────────────────────────────────────────────────────── routes
-    def _route(self, path, q, base, t0):
+    def _route(self, path, q, base, t0, cfg=None):
+        cfg = cfg or get_cfg()
         if path == "/health":
             return self._send(200, {
                 "ok": True, "addon": ADDON_NAME, "version": VERSION,
@@ -1941,8 +2972,11 @@ class Handler(BaseHTTPRequestHandler):
                 "stats": dict(_STATS),
                 "blocked_hosts_s": int(_blocked_left()),
                 "proxy": _pool_stats(),
+                "catalogs": [(c["type"], c["id"]) for c in CAT_DEFS],
+                "configurable": True,
                 "caches": [c.stats() for c in
-                           (C_SEARCH, C_PAGE, C_META, C_EMBED, C_N1, C_STREAM)],
+                           (C_SEARCH, C_PAGE, C_META, C_EMBED, C_N1, C_STREAM,
+                            C_LIST, C_IMDB, C_METARES)],
                 "stale": len(C_STALE), "reqlog_len": len(_REQLOG),
                 "egress": "text-only (json), zero media bytes",
             })
@@ -1950,20 +2984,51 @@ class Handler(BaseHTTPRequestHandler):
             html = (LANDING.replace("__NAME__", ADDON_NAME)
                     .replace("__VERSION__", VERSION).replace("__BASE__", base))
             return self._send(200, html, "text/html", cache=300)
-        if path == "/manifest.json":
-            man = dict(MANIFEST)
-            man["logo"] = MANIFEST["logo"]
-            return self._send(200, man, cache=3600)
-        if path == "/configure" or path == "/config":
-            return self._send(200, {"configured": True})
+        if path in ("/manifest.json", "/manifest"):
+            return self._send(200, manifest(cfg), cache=600)
+        if path in ("/configure", "/config"):
+            html = (CONFIG_PAGE.replace("__NAME__", ADDON_NAME)
+                    .replace("__VERSION__", VERSION).replace("__BASE__", _public_base(self))
+                    .replace("__CFG__", json.dumps(cfg_unpack(q.get("c", [""])[0]) or
+                                                   dict(CFG_DEFAULTS)))
+                    .replace("__DEF__", json.dumps(CFG_DEFAULTS))
+                    .replace("__NMAX__", str(MAX_CARDS)))
+            return self._send(200, html, "text/html", cache=300)
+        if path == "/validate-key":
+            return self._send(200, {"valid": validate_tmdb_key((q.get("key") or [""])[0])})
+        m = _CAT_RE.match(path)
+        if m:
+            ctype, cid = m.group(1), m.group(2)
+            if (ctype, cid) not in CAT_IDS:
+                return self._send(404, {"metas": [], "error": "unknown catalog"})
+            extras = _path_extras(m.group(3) or "")
+            genre = extras.get("genre") or (q.get("genre") or [""])[0]
+            search = extras.get("search") or (q.get("search") or [""])[0]
+            skip = extras.get("skip") or (q.get("skip") or ["0"])[0]
+            try:
+                skip = int(skip or 0)
+            except Exception:
+                skip = 0
+            metas = catalog_items(ctype, cid, genre, search, skip, cfg)
+            _log({"t": int(time.time()), "path": path, "cat": cid,
+                  "genre": genre, "search": (search or "")[:30], "skip": skip,
+                  "metas": len(metas), "ms": int((time.time() - t0) * 1000)})
+            return self._send(200, {"metas": metas}, cache=300)
+        m = _META_RE.match(path)
+        if m:
+            ctype, raw = m.group(1), m.group(2)
+            mid, _se, _ep = _split_id(ctype, raw)
+            meta = build_meta(ctype, mid, cfg)
+            return self._send(200, {"meta": meta or {}},
+                              cache=3600 if meta else 60)
         m = _STREAM_RE.match(path)
         if m:
             ctype, raw = m.group(1), m.group(2)
             imdb, se, ep = _split_id(ctype, raw)
-            if not imdb.startswith("tt") or len(imdb) < 4:
+            if not (imdb.startswith("tt") or imdb.startswith("bpx-")) or len(imdb) < 4:
                 return self._send(404, {"streams": [], "message": "unsupported id"})
             res = build_streams(ctype, imdb, se, ep)
-            cards = _absolutize(res.get("streams") or [], base)
+            cards = apply_cfg(_absolutize(res.get("streams") or [], base), cfg)
             out = {"streams": cards}
             if res.get("message"):
                 out["message"] = res["message"]
@@ -1976,6 +3041,12 @@ class Handler(BaseHTTPRequestHandler):
             ctype, raw = m.group(1), m.group(2)
             imdb, se, ep = _split_id(ctype, raw)
             subs = self._subtitles_for(ctype, imdb, se, ep)
+            if (cfg.get("subs") or "").lower() == "off":
+                subs = []
+            else:
+                want = [x.strip().lower() for x in (cfg.get("subs") or "").split(",")]
+                order = {l: i for i, l in enumerate(want)}
+                subs = sorted(subs, key=lambda s: order.get((s.get("lang") or "").lower(), 99))
             return self._send(200, {"subtitles": subs}, cache=300)
         if path.startswith("/debug/"):
             return self._debug(path, q)
@@ -2144,10 +3215,24 @@ _KEEPALIVE = [""]
 _KEEPALIVE_LOCK = threading.Lock()
 
 
+def _pool_maintain():
+    """Re-pull + re-train the pool in the background.
+
+    Only worth doing once this egress has proven a host blocked (otherwise the
+    pool is never used and probing free exits is pure waste)."""
+    try:
+        if not POOL_ON or not _DIRECT_BAD:
+            return
+        _pool_refresh()
+    except Exception:
+        pass
+
+
 def _keepalive_loop():
     """Render free sleeps after ~15 idle minutes. Learn the public URL from the
     first request Host header (or BPX_PUBLIC_URL) and self-ping forever."""
     while True:
+        _pool_maintain()
         try:
             url = _KEEPALIVE[0] or _PUBLIC_BASE[0]
             if url:
@@ -2178,6 +3263,10 @@ def _liveness_watchdog():
 def main():
     threading.Thread(target=_keepalive_loop, daemon=True).start()
     threading.Thread(target=_liveness_watchdog, daemon=True).start()
+    if os.environ.get("BPX_PREWARM", "1") != "0":
+        # own thread: a slow proxied shelf fetch must never delay the keepalive
+        # ping that keeps Render's free tier awake
+        threading.Thread(target=catalog_prewarm, daemon=True, name="prewarm").start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     srv.daemon_threads = True
     sys.stdout.write("%s %s listening on :%d (strict zero-bandwidth)\n"

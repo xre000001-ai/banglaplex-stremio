@@ -1,13 +1,14 @@
 # BanglaPlex — Stremio addon
 
-**banglaplex.biz** → Stremio. Stream-only addon (no catalogs): open any movie or
-series from your own catalogs (Cinemeta, Trakt, IMDb lists…) and this addon
-answers with verified direct-CDN streams + subtitles.
+**banglaplex.biz** → Stremio. Browse BanglaPlex's own shelves *and* answer any
+title from your existing catalogs (Cinemeta, Trakt, IMDb lists…) with verified
+direct-CDN streams + subtitles.
 
 Bangla / Hindi / Hollywood movies and web-series, up to 1080p.
 
 ```
 Install URL:  https://<your-service>.onrender.com/manifest.json
+Configure:    https://<your-service>.onrender.com/configure
 ```
 
 ---
@@ -51,22 +52,108 @@ contains the asked-for season/episode, labelled honestly
 (`◫ S01 E01 ◇ ⚠ full-season file`). An episode-level request never falls back to
 a *different* episode pack — wrong content is worse than an honest empty.
 
-### Egress: direct first, proxy pool only when the host blocks us
+### Egress: direct first, trained proxy pool only when the host blocks us
 
-Render's Singapore egress is **Cloudflare-flagged on banglaplex.biz**: the JSON
-autocomplete answers `200 []` while `/watch/` and `/search/` come back 403 (the
-same calls work from a normal IP). So every site fetch is adaptive — try direct,
-and the moment a host proves blocked *from here*, bench direct egress for that
-host (10 min) and ride a free proxy pool (proxyscrape, refreshed every 6 min,
-exits scored + sticky for 90 s, bad exits benched 5 min / platform-blocked
-15 min). The fallback happens **inside the same call**, so a user never sees the
-first failure. From an unblocked IP the pool is never touched at all.
+Render's Singapore egress is **Cloudflare-flagged on banglaplex.biz**: `/watch/`
+and `/search/` come back 403 (a 5.5 KB challenge page) while the JSON autocomplete
+answers `200 []` — the same calls work from a normal IP. So every site fetch is
+adaptive: try direct, and the moment a host proves blocked *from here*, bench
+direct egress for that host (10 min) and ride the pool **inside the same call**,
+so a user never sees the first failure. From an unblocked IP the pool is never
+even refreshed (measured: pool size stays 0).
 
-`/debug/net?k=…` probes every host both ways (direct vs exit) and reports status,
-bytes, ms and a body snippet — the fastest way to see what an egress can reach.
+The pool is trained, not scraped-and-hoped (MovieBox pattern):
+
+* **Sources** — proxyscrape by default (`proxy_type=http`), comma-separable for
+  more, plus `BPX_PROXY_LIST` for hand-picked exits that always ride first.
+* **Scheme filter** — socks4/5 exits are dropped: without PySocks every one of
+  them raises `InvalidSchema`, so a 40/40 socks list reads as "all proxies down".
+* **Probing** — a background trainer platform-probes candidates against the
+  *actually blocked* endpoint (cheap ~360 B autocomplete hit) in parallel waves,
+  publishes wave 1 immediately, then keeps the 20 fastest and **merges** them
+  with already-trained members instead of replacing them.
+* **Scoring** — every exit keeps `ok/fail/EWMA-latency`; picks order by
+  `quality × speed`, and a good exit stays **sticky for 90 s** (capped at 2
+  in-flight) so one resolve chain rides one exit instead of re-rolling dice.
+* **Racing** — a fetch races `BPX_PROXY_TRY=5` exits concurrently and keeps the
+  first good answer, closing the losers. Free exits are mostly dead or slow;
+  walking them cost 8 s per corpse and a cold resolve never fit the 22 s wall.
+* **Benching** — dead exit 5 min, platform-blocked (403/503) 15 min.
+* **Never in front of a user** — the source list is pulled synchronously (fast),
+  training happens on its own thread, and `_pool_maintain()` re-trains from the
+  keepalive loop only while some host is actually benched.
 
 Segment probes (`_range_probe`) are **never** proxied: playability must be proven
-on a normal client path, and no media byte may ride a free exit.
+on a normal client path, and no media byte may ride a free exit
+(`relay_bytes` stays 0).
+
+`/debug/net?k=…` probes every host both ways (direct vs the racing pool) and
+reports status, bytes, ms and a body snippet — the fastest way to see what an
+egress can reach. The probe uses the *same* racing path as a real fetch; an
+earlier version tested one exit and reported `ReadTimeout` for everything while
+resolves were succeeding.
+
+### Catalogs
+
+Three shelves scraped from the site itself, each with `search`, `genre` and
+`skip` extras:
+
+| catalog | source | pagination |
+|---|---|---|
+| `movie/bpx-latest` | homepage card grid (~87 unique cards, movies and series split by their TV badge) | slices the cached listing |
+| `movie/bpx-year` | `/year/<this year>` | path offsets |
+| `series/bpx-series` | `/genre/bengali-web-series` | path offsets |
+
+`genre` options are the site's own slugs (21 movie + 6 series). Note that
+**pagination on this site is path-based**: `/genre/action/24.html` is page 2 —
+`?page=2` is silently ignored and returns page 1 (measured).
+
+Every card gets an id: an **IMDb `tt…`** when a suggestion matches title *and*
+year *and* type strictly, otherwise **`bpx-<slug>`**, a source id this addon can
+both stream and describe. A wrong `tt` would show another film's poster, which is
+worse than no mapping — measured example: *Jaatishwar* is "The Reincarnate" on
+IMDb, so it ships as `bpx-jaatishwar`. Roughly ⅛ of a shelf ends up source-only
+and still plays.
+
+### Metadata: providers first, **source fallback** second
+
+`/meta/{type}/{id}.json` races Cinemeta + TMDB (the install's own key if given,
+else the built-in one). If the providers leave a visible hole — no poster or no
+synopsis — the watch page is scraped and fills exactly those fields
+(`og:*`, plus the Director / Writer / Actor / Country / Release / Duration /
+Quality / Genre rows). For `bpx-<slug>` ids the source is the *only* provider, so
+regional titles IMDb/TMDB never heard of still get a full detail page. Every
+shape is normalised before it ships: Cinemeta sends `director` as a list and no
+`year` (only `releaseInfo`), the site sends comma strings.
+
+Listing pages are cached **parsed** (never the raw 375 KB HTML) and served
+stale-while-revalidate, so a shelf refresh never makes a user wait for a proxied
+fetch. Boot prewarms all three shelves on their own thread.
+
+### Configuration
+
+`behaviorHints.configurable: true` + a self-contained `/configure` page (no
+third-party assets, so it renders inside Stremio's webview). The config travels
+**inside the install URL** as one base64url segment — nothing is stored
+server-side:
+
+```
+https://host/eyJjYXQiOiJzZXJpZXMifQ/manifest.json
+```
+
+| option | values | effect |
+|---|---|---|
+| `n` | 1…`BPX_MAX_CARDS` | cards per title |
+| `q` | `all` `720` `1080` | minimum resolution floor (unmeasured cards are never dropped) |
+| `cdn` | `both` `tiktok` `cf` | server preference — a *preference*: if the title only has the other server, that card still ships instead of an empty list |
+| `subs` | `en,hi,bn,…` or `off` | subtitle languages, leftmost wins (reorders + filters the track list and the `⟡ N SUB` label) |
+| `cat` | `all` `movie` `series` `off` | which shelves appear in the board |
+| `tmdb` | 32-char key | the user's own TMDB key for richer art (validated live via `/validate-key`) |
+
+Filtering happens on the way out (`apply_cfg`), not inside the build, so the
+shared cache stays config-independent: one verified build serves every install.
+The page's JS encoder produces byte-identical segments to the server's decoder
+(asserted in tests).
 
 ### Zero bandwidth
 
@@ -105,11 +192,16 @@ otherwise stream ~1.4 MB per probe into the dyno.
 | path | what |
 |------|------|
 | `/` | landing page + install button |
-| `/manifest.json` | stream-only manifest (`resources: [stream, subtitles]`, `catalogs: []`) |
-| `/stream/{movie\|series}/{tt…[:S:E]}.json` | the cards |
+| `/configure` | configuration page (install URL builder) |
+| `/validate-key?key=…` | live TMDB key check |
+| `/manifest.json` | `resources: [stream, subtitles, catalog, meta]`, 3 catalogs |
+| `/catalog/{movie\|series}/{id}.json` | a shelf — `?genre=` `?search=` `?skip=` (also path-style `genre=x;skip=24`) |
+| `/meta/{type}/{id}.json` | detail page — providers + source fallback |
+| `/stream/{movie\|series}/{tt…\|bpx-…[:S:E]}.json` | the cards |
 | `/subtitles/{type}/{id}[/{extra}].json` | subtitle tracks for players that ask separately |
 | `/health` | version, uptime, stats, per-cache bytes, keepalive state |
-| `/debug/…?k=BPX_DEBUG_KEY` | `search` `page` `embed` `n1` `chain` `resolve` `reqlog` `mem` |
+| `/debug/…?k=BPX_DEBUG_KEY` | `search` `page` `embed` `n1` `chain` `resolve` `reqlog` `mem` `net` |
+| `/{config}/…` | any route with a per-install config segment |
 
 `/debug/resolve?k=…&slug=the-revolutionaries&type=series&s=1&e=1` runs the whole
 chain for one site slug and reports every intermediate step — the fastest way to
@@ -152,8 +244,11 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 | `BPX_CARDS` | `1` | `0` = kill switch, answers empty |
 | `BPX_INHOUSE` | `0` | `1` = also emit the IP-bound raw-IP path (debug only) |
 | `BPX_PROXY` | `auto` | `0` = never use the free proxy pool |
-| `BPX_PROXY_SOURCE` | proxyscrape | free HTTP proxy list URL |
-| `BPX_PROXY_TRY` | `3` | exits attempted per fetch |
+| `BPX_PROXY_SOURCE` | proxyscrape | free HTTP proxy list URL(s), comma-separated |
+| `BPX_PROXY_LIST` | *(none)* | hand-picked exits (`http://user:pass@host:port,…`) — always ride first |
+| `BPX_PROXY_TRY` | `5` | exits raced concurrently per fetch |
+| `BPX_POOL_MAX` | `20` | trained exits kept |
+| `BPX_PREWARM` | `1` | `0` = do not warm the catalog shelves at boot |
 | `BPX_DEBUG_KEY` | `bpx-dbg-4c9e` | `/debug/*` key — **change this in prod** |
 | `TMDB_API_KEY` | built-in | metadata + alternative titles |
 
@@ -162,7 +257,7 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 ## Tests
 
 ```bash
-python3 test_banglaplex.py           # 123 offline tests, every network call mocked
+python3 test_banglaplex.py           # 198 offline tests, every network call mocked
 BPX_LIVE=1 python3 test_banglaplex.py # + 4 live integration tests (real site/CDN)
 ```
 

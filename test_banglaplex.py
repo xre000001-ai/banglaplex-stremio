@@ -41,7 +41,8 @@ def run(test):
 
 def clear_caches():
     for c in (addon.C_SEARCH, addon.C_PAGE, addon.C_META, addon.C_EMBED,
-              addon.C_N1, addon.C_STREAM):
+              addon.C_N1, addon.C_STREAM, addon.C_LIST, addon.C_IMDB,
+              addon.C_METARES):
         c.clear()
         c.bytes = 0
     addon.C_STALE.clear()
@@ -1276,12 +1277,23 @@ def test_http_health():
     assert {"name", "entries", "bytes", "budget"} <= set(d["caches"][0])
 
 
-def test_http_manifest_is_stream_only():
+def test_http_manifest_declares_catalogs_meta_and_config():
     d = _json_body(_http_get("/manifest.json"))
     assert d["id"] == "com.banglaplex.stremio"
-    assert d["resources"] == ["stream", "subtitles"]
-    assert d["catalogs"] == [] and d["types"] == ["movie", "series"]
-    assert d["idPrefixes"] == ["tt"]
+    assert d["resources"] == ["stream", "subtitles", "catalog", "meta"]
+    assert d["types"] == ["movie", "series"]
+    # bpx- ids must be declared or Stremio will not route our own catalog items
+    # back to this addon for stream/meta
+    assert d["idPrefixes"] == ["tt", "bpx-"]
+    assert d["behaviorHints"]["configurable"] is True
+    assert {(c["type"], c["id"]) for c in d["catalogs"]} == {
+        ("movie", "bpx-latest"), ("movie", "bpx-year"), ("series", "bpx-series")}
+    for c in d["catalogs"]:
+        names = [e["name"] for e in c["extra"]]
+        assert "search" in names, c
+    genres = {o for c in d["catalogs"] for e in c["extra"]
+              if e["name"] == "genre" for o in e["options"]}
+    assert "bengali-movies" in genres and "bengali-web-series" in genres
 
 
 def test_http_landing_page():
@@ -1339,14 +1351,29 @@ def test_http_subtitles_route_both_shapes():
 
 
 def test_http_gzip():
-    big = {"streams": [_card("c%d" % i,
-                             "https://bpx.strp2p.site/hls/%d/master.m3u8" % i)
-                       for i in range(30)]}
-    with mock.patch.object(addon, "build_streams", return_value=big):
-        c = _http_get("/stream/movie/tt0213890.json", accept_enc="gzip")
+    big = {"metas": [{"id": "tt%07d" % i, "type": "movie", "name": "Title %d" % i,
+                      "poster": "https://banglaplex.biz/uploads/video_thumb/%d.jpg" % i}
+                     for i in range(60)]}
+    with mock.patch.object(addon, "catalog_items", return_value=big["metas"]):
+        c = _http_get("/catalog/movie/bpx-latest.json", accept_enc="gzip")
     assert c["headers"].get("Content-Encoding") == "gzip"
     assert len(c["body"]) == int(c["headers"]["Content-Length"])
-    assert len(_json_body(c)["streams"]) == 30
+    assert len(_json_body(c)["metas"]) == 60
+
+
+def test_http_stream_cards_are_capped_by_config():
+    """apply_cfg caps to the install's card limit; the shared cache still holds
+    every verified card so a different config gets its own slice."""
+    many = {"streams": [_card("c%d" % i,
+                              "https://bpx.strp2p.site/hls/%d/master.m3u8" % i)
+                        for i in range(9)]}
+    with mock.patch.object(addon, "build_streams", return_value=many):
+        c = _http_get("/stream/movie/tt0213890.json")
+    assert len(_json_body(c)["streams"]) == addon.MAX_CARDS
+    seg = addon.cfg_pack({"n": 1})
+    with mock.patch.object(addon, "build_streams", return_value=many):
+        c1 = _http_get("/%s/stream/movie/tt0213890.json" % seg)
+    assert len(_json_body(c1)["streams"]) == 1
 
 
 def test_http_no_gzip_for_tiny_body():
@@ -1391,8 +1418,12 @@ def _pool_reset():
     addon._POOL[0] = ["http://1.1.1.1:8080", "http://2.2.2.2:8080",
                       "http://3.3.3.3:8080"]
     addon._POOL_TS[0] = time.time()
+    # a real background trainer spawned by an earlier test outlives its mock and
+    # benches whatever it probes, polluting later assertions
+    addon._TRAINING[0] = True
     addon._POOL_BAD.clear()
-    addon._POOL_OK.clear()
+    addon._POOL_STATS.clear()
+    addon._STICKY_BUSY.clear()
     addon._STICKY[0], addon._STICKY[1] = None, 0.0
     addon._DIRECT_BAD.clear()
 
@@ -1441,17 +1472,23 @@ def test_fetch_falls_back_to_pool_on_403_in_the_same_call():
     """Render's egress is Cloudflare-flagged: the user must never see the first
     failure, and the host must stop paying for a direct attempt afterwards."""
     _pool_reset()
-    seq = [_resp(403, "cf challenge"), _resp(200, "<html>watch</html>")]
+    ok = _resp(200, "<html>watch</html>")
     used = []
 
     def fake(u, **k):
+        p = (k.get("proxies") or {}).get("http")
         used.append(k.get("proxies"))
-        return seq.pop(0)
+        if p is None:
+            return _resp(403, "cf challenge")          # Render egress flagged
+        if p == "http://3.3.3.3:8080":
+            time.sleep(0.25)                           # winner arrives last
+            return ok
+        raise RuntimeError("dead exit")
     with mock.patch.object(addon._S, "get", side_effect=fake):
         r, via = addon._fetch("https://banglaplex.biz/watch/x.html")
     assert r.status_code == 200 and via is True
-    assert used[0] is None and used[1] == {"http": "http://1.1.1.1:8080",
-                                           "https": "http://1.1.1.1:8080"}
+    assert used[0] is None, "direct is always tried first"
+    assert len(used) == 4, "every exit must be raced: %r" % used
     assert addon._DIRECT_BAD["banglaplex.biz"] > time.time()
     used2 = []
     with mock.patch.object(addon._S, "get",
@@ -1526,16 +1563,17 @@ def test_net_probe_reports_both_paths():
         seen.append(k.get("proxies"))
         if k.get("proxies") is None:
             return _resp(403, "cf")            # direct blocked from Render
-        if (k["proxies"]["http"]) == "http://1.1.1.1:8080":
-            raise RuntimeError("dead")
-        return good                            # a later exit works
+        if k["proxies"]["http"] == "http://3.3.3.3:8080":
+            time.sleep(0.3)                    # the winner arrives LAST
+            return good
+        raise RuntimeError("dead")
     with mock.patch.object(addon._S, "get", side_effect=fake):
         d = addon._net_probe(only="site_home")
     assert list(d["probes"]) == ["site_home"]
     row = d["probes"]["site_home"]
     assert row["direct"][0] == 403
     assert row["proxy"][0] == 200, row["proxy"]
-    assert len(seen) > 2, "the probe must race several exits, not just one"
+    assert len(seen) == 4, "the probe must race every exit, not just one: %r" % seen
     assert d["pool"]["pool"] == 3
 
 
@@ -1565,7 +1603,7 @@ def test_pool_get_races_exits_and_keeps_first_good():
     def fake(u, **k):
         p = (k.get("proxies") or {}).get("http")
         if p == "http://1.1.1.1:8080":
-            time.sleep(0.4)
+            time.sleep(0.2)
             return Slow()                      # a LATE winner must be closed
         if p == "http://2.2.2.2:8080":
             return good                        # first good answer wins
@@ -1573,12 +1611,12 @@ def test_pool_get_races_exits_and_keeps_first_good():
     with mock.patch.object(addon._S, "get", side_effect=fake):
         r = addon._pool_get("https://x/y", {"User-Agent": "t"}, 5)
     assert r is good
-    for _ in range(40):                        # let the losers finish cleanly
+    for _ in range(100):                       # losers close on their own thread
         if closed:
             break
         time.sleep(0.05)
     assert "slow" in closed, "losing racers must be closed, not leaked"
-    assert addon._POOL_OK.get("http://2.2.2.2:8080"), "the winner becomes sticky"
+    assert addon._POOL_STATS.get("http://2.2.2.2:8080"), "the winner becomes sticky"
 
 
 def test_pool_get_benches_dead_exits():
@@ -1591,6 +1629,830 @@ def test_pool_get_benches_dead_exits():
 def test_pool_get_no_exits():
     addon._POOL[0] = []
     assert addon._pool_get("https://x", {}, 3) is None
+
+
+# ── trained pool (MovieBox pattern): probe, latency EWMA, merge-not-replace ──
+def test_site_probe_classifies_exits():
+    class R:
+        def __init__(s, c): s.status_code = c
+        def close(s): pass
+    for code, want in ((200, "good"), (403, "blocked"), (503, "blocked"), (500, "dead")):
+        with mock.patch.object(addon._S, "get", return_value=R(code)):
+            kind, ms = addon._site_probe("http://1.1.1.1:8080")
+        assert kind == want, (code, kind)
+    with mock.patch.object(addon._S, "get", side_effect=RuntimeError("t/o")):
+        assert addon._site_probe("http://1.1.1.1:8080")[0] == "dead"
+
+
+def test_site_probe_hits_the_blocked_host_not_a_canary():
+    """probing a generic site proves nothing: the whole point is that THIS egress
+    is flagged on banglaplex.biz specifically."""
+    seen = []
+    class R:
+        status_code = 200
+        def close(self): pass
+    with mock.patch.object(addon._S, "get",
+                           side_effect=lambda u, **k: seen.append(u) or R()):
+        addon._site_probe("http://1.1.1.1:8080")
+    assert seen and "banglaplex" in seen[0] and "autocomplete" in seen[0], seen
+
+
+def test_pool_score_prefers_fast_and_reliable():
+    _pool_reset()
+    addon._POOL_STATS["http://1.1.1.1:8080"] = {"ok": 9, "fail": 0, "lat": 300}
+    addon._POOL_STATS["http://2.2.2.2:8080"] = {"ok": 9, "fail": 0, "lat": 6000}
+    addon._POOL_STATS["http://3.3.3.3:8080"] = {"ok": 1, "fail": 9, "lat": 300}
+    assert addon._pool_order() == ["http://1.1.1.1:8080", "http://3.3.3.3:8080",
+                                   "http://2.2.2.2:8080"], addon._pool_order()
+
+
+def test_pool_note_tracks_ewma_latency():
+    _pool_reset()
+    addon._pool_note("http://1.1.1.1:8080", True, ms=1000)
+    assert addon._POOL_STATS["http://1.1.1.1:8080"]["lat"] == 1000
+    addon._pool_note("http://1.1.1.1:8080", True, ms=500)
+    assert addon._POOL_STATS["http://1.1.1.1:8080"]["lat"] == 800   # 0.6*1000+0.4*500
+
+
+def test_sticky_exit_caps_at_two_in_flight():
+    """one chain should ride one exit, but a busy sticky must not serialise every
+    concurrent racer behind it."""
+    _pool_reset()
+    addon._POOL_STATS["http://1.1.1.1:8080"] = {"ok": 20, "fail": 0, "lat": 100}
+    addon._pool_note("http://2.2.2.2:8080", True, ms=100)      # becomes sticky
+    assert addon._pool_order()[0] == "http://2.2.2.2:8080", "sticky wins while idle"
+    addon._STICKY_BUSY["http://2.2.2.2:8080"] = 2
+    assert addon._pool_order()[0] == "http://1.1.1.1:8080", "busy sticky yields"
+    assert addon._pool_order()[1] == "http://2.2.2.2:8080", "...but stays in the list"
+
+
+def test_pool_train_merges_and_keeps_fastest():
+    _pool_reset()
+    addon._POOL[0] = ["http://old.healthy:8080"]
+    addon._POOL_STATS["http://old.healthy:8080"] = {"ok": 5, "fail": 0, "lat": 200}
+    lats = {"http://slow:8080": 3000, "http://fast:8080": 150}
+
+    def probe(u, timeout=None):
+        if u == "http://dead:8080":
+            return "dead", 9999
+        if u == "http://flagged:8080":
+            return "blocked", 900
+        return "good", lats[u]
+    with mock.patch.object(addon, "_site_probe", side_effect=probe):
+        addon._pool_train(["http://fast:8080", "http://slow:8080",
+                           "http://dead:8080", "http://flagged:8080"])
+    order = addon._POOL[0]
+    assert order.index("http://fast:8080") < order.index("http://slow:8080"), order
+    assert "http://dead:8080" not in order and "http://flagged:8080" not in order
+    # MERGE, never replace: an already-trained healthy member must survive
+    assert "http://old.healthy:8080" in order, order
+    assert addon._POOL_STATS["http://fast:8080"]["lat"] == 150
+    assert addon._POOL_BAD.get("http://flagged:8080", 0) - time.time() > 600
+
+
+def test_pool_pull_prefers_manual_exits_and_dedupes():
+    txt = "http://1.2.3.4:8080\nhttp://manual:9999\nsocks5://9.9.9.9:1080\n"
+    with mock.patch.object(addon, "POOL_MANUAL", ["http://manual:9999"]), \
+         mock.patch.object(addon.requests, "get", return_value=_resp(200, txt)):
+        out = addon._pool_pull()
+    assert out[0] == "http://manual:9999", out
+    assert "socks5://9.9.9.9:1080" not in out
+    assert out.count("http://manual:9999") == 1
+
+
+def test_pool_pull_survives_a_dead_source():
+    good = _resp(200, "http://7.7.7.7:8080\n")
+    calls = []
+
+    def fake(u, **k):
+        calls.append(u)
+        if len(calls) == 1:
+            raise RuntimeError("source down")
+        return good
+    with mock.patch.object(addon, "POOL_SRCS", ["https://a/x", "https://b/y"]), \
+         mock.patch.object(addon.requests, "get", side_effect=fake):
+        out = addon._pool_pull()
+    assert out == ["http://7.7.7.7:8080"], out
+
+
+def test_refresh_publishes_untrained_then_trains_in_background():
+    """a user request must never wait for the trainer: publish first, learn after."""
+    _pool_reset()
+    addon._TRAINING[0] = False
+    addon._POOL[0] = []
+    addon._POOL_TS[0] = 0.0
+    started = []
+
+    class FakeThread:
+        def __init__(self, **k):
+            self.k = k
+
+        def start(self):
+            started.append(self.k)
+    with mock.patch.object(addon, "_pool_pull", return_value=["http://9.9.9.9:8080"]), \
+         mock.patch.object(addon.threading, "Thread", FakeThread):
+        out = addon._pool_refresh()
+    assert out == ["http://9.9.9.9:8080"], out
+    assert started and started[0].get("name") == "pooltrain", started
+
+
+def test_refresh_is_throttled():
+    _pool_reset()
+    with mock.patch.object(addon, "_pool_pull", side_effect=AssertionError("must not pull")):
+        assert len(addon._pool_refresh()) == 3
+
+
+def test_pool_maintain_only_when_an_egress_is_blocked():
+    """from an unblocked IP the pool is never used, so training free exits is
+    pure waste (measured: a probe wave is 90 candidate sockets)."""
+    _pool_reset()
+    addon._DIRECT_BAD.clear()
+    with mock.patch.object(addon, "_pool_refresh", side_effect=AssertionError("wasted")):
+        addon._pool_maintain()
+    addon._DIRECT_BAD["banglaplex.biz"] = time.time() + 600
+    with mock.patch.object(addon, "_pool_refresh", return_value=["x"]) as pr:
+        addon._pool_maintain()
+    assert pr.called
+
+
+def test_disabled_pool_stays_empty():
+    _pool_reset()
+    with mock.patch.object(addon, "POOL_ON", False):
+        assert addon._pool_refresh(force=True) == []
+        assert addon._pool_stats()["enabled"] is False
+
+
+def test_health_reports_trained_pool():
+    _pool_reset()
+    addon._POOL_STATS["http://1.1.1.1:8080"] = {"ok": 3, "fail": 0, "lat": 400}
+    st = addon._pool_stats()
+    assert st["trained"] == 1 and st["median_ms"] == 400 and st["pool"] == 3
+
+
+_CARD_TMPL = """<div class="col-md-2 col-sm-3 col-xs-6" style="position:relative;">
+<div class="popup">
+<div class="latest-movie-img-container lazy" style="background-image: url('__POSTER__'); display: inline-block;">
+<div class="movie-img" style="position: relative; overflow: hidden;">
+<a href="https://banglaplex.biz/watch/__SLUG__.html" class="ico-play ico-play-sm"><svg></svg></a>
+<div class="overlay-div"></div>
+__TREND__
+<div class="video_badges_group_movie">
+<div class="video_quality_movie"><span class="label label-primary"> __QUALITY__ </span></div>
+<div class="video_year_movie"><span class="label label-year"> __YEAR__ </span></div>
+</div>
+__TV__
+<div class="imdb-rating"><span class="label label-imdb">
+<i class="fa fa-info-circle"></i> IMDB 7.5 </span></div>
+<div class="movie-title"><h3>
+<a href="https://banglaplex.biz/watch/__SLUG__.html">__TITLE__</a>
+</h3></div></div></div></div>"""
+
+
+def _listing(n=3, series=False, year=2026, quality="HDTC"):
+    """OVOO card grid, shaped exactly like banglaplex.biz markup."""
+    out = []
+    for i in range(n):
+        out.append((_CARD_TMPL
+                    .replace("__POSTER__", "https://banglaplex.biz/uploads/video_thumb/%d.jpg" % (100 + i))
+                    .replace("__SLUG__", "title-%d" % i)
+                    .replace("__TITLE__", "Title %d" % i)
+                    .replace("__YEAR__", str(year))
+                    .replace("__QUALITY__", quality)
+                    .replace("__TREND__", ('<div class="video_trending_badge"><span '
+                                           'class="label label-trending">TRENDING</span></div>')
+                             if i == 0 else "")
+                    .replace("__TV__", ('<div class="video_type_label_tv"><span '
+                                        'class="label label-tvseries">SERIES</span></div>')
+                             if series else "")))
+    return "".join(out)
+
+
+def test_parse_listing_reads_every_card_field():
+    items = addon.parse_listing(_listing(3))
+    assert len(items) == 3
+    a = items[0]
+    assert a["slug"] == "title-0" and a["title"] == "Title 0"
+    assert a["poster"] == "https://banglaplex.biz/uploads/video_thumb/100.jpg"
+    assert a["year"] == 2026 and a["quality"] == "HDTC"
+    assert a["rating"] == 7.5 and a["series"] is False and a["trending"] is True
+    assert items[1]["trending"] is False
+
+
+def test_parse_listing_detects_series_and_dedupes():
+    h = _listing(2, series=True) + _listing(2, series=True)     # same cards twice
+    items = addon.parse_listing(h)
+    assert len(items) == 2, "duplicate watch links must collapse"
+    assert all(i["series"] for i in items)
+
+
+def test_parse_listing_survives_garbage():
+    assert addon.parse_listing("") == []
+    assert addon.parse_listing("<html>no cards</html>") == []
+    assert addon.parse_listing(None) == []
+
+
+def test_catalog_source_pagination_is_path_based():
+    """the site IGNORES ?page= — offsets live in the path (measured live:
+    /genre/action/24.html is page 2, ?page=2 returns page 1)."""
+    u, mode = addon.catalog_source("bpx-latest", "movie", "", 0)
+    assert u == addon.SITE + "/" and mode == "home"
+    u, _ = addon.catalog_source("bpx-latest", "movie", "", 30)
+    assert u == addon.SITE + "/" and mode == "home"
+    u, mode = addon.catalog_source("bpx-latest", "movie", "action", 0)
+    assert u.endswith("/genre/action.html") and mode == "page"
+    u, _ = addon.catalog_source("bpx-latest", "movie", "action", 24)
+    assert u.endswith("/genre/action/24.html"), u
+    u, _ = addon.catalog_source("bpx-latest", "movie", "action", 48)
+    assert u.endswith("/genre/action/48.html"), u
+    u, _ = addon.catalog_source("bpx-year", "movie", "", 24)
+    assert "/year/%d/24.html" % addon._THIS_YEAR in u, u
+    u, _ = addon.catalog_source("bpx-series", "series", "", 0)
+    assert u.endswith("/genre/bengali-web-series.html"), u
+    u, _ = addon.catalog_source("bpx-series", "series", "korean-web-series", 24)
+    assert u.endswith("/genre/korean-web-series/24.html"), u
+
+
+def test_list_page_serves_stale_and_revalidates_in_background():
+    """the homepage is ~375 KB and rides a free exit from Render (~9 s measured):
+    a stale shelf beats a spinner."""
+    clear_caches()
+    addon._LIST_STALE.clear()
+    addon._LIST_REFRESH.clear()
+    items = addon.parse_listing(_listing(2))
+    addon._LIST_STALE["https://x/list"] = (time.time() + 600, items)
+
+    class R:
+        status_code = 200
+        text = _listing(4)
+    served = []
+    with mock.patch.object(addon, "_get", side_effect=lambda u, **k: served.append(u) or R()):
+        got = addon.list_page("https://x/list")
+    assert len(got) == 2, "stale served immediately"
+    for _ in range(60):
+        if served:
+            break
+        time.sleep(0.05)
+    assert served == ["https://x/list"], "and revalidated in the background"
+    for _ in range(60):
+        hit, val = addon.C_LIST.get("https://x/list")
+        if hit:
+            break
+        time.sleep(0.05)
+    assert hit and len(val) == 4, "the fresh page lands in the cache"
+    assert not addon._LIST_REFRESH, "the refresh flag must be released"
+
+
+def test_list_page_transient_failure_caches_nothing():
+    clear_caches()
+    addon._LIST_STALE.clear()
+    with mock.patch.object(addon, "_get", return_value=None):
+        assert addon.list_page("https://x/dead") is None
+    assert not addon.C_LIST.get("https://x/dead")[0]
+
+
+def test_catalog_prewarm_is_crash_proof():
+    with mock.patch.object(addon, "catalog_items", side_effect=RuntimeError("boom")):
+        addon.catalog_prewarm()          # must not raise
+
+
+def test_prewarm_covers_every_default_shelf():
+    seen = []
+    with mock.patch.object(addon, "catalog_items",
+                           side_effect=lambda t, c, **k: seen.append((t, c))):
+        addon.catalog_prewarm()
+    assert seen == [("movie", "bpx-latest"), ("movie", "bpx-year"),
+                    ("series", "bpx-series")], seen
+
+
+def test_main_spawns_prewarm_off_the_keepalive_thread():
+    """the keepalive ping is what keeps Render's free tier awake — a slow proxied
+    shelf fetch must not sit in front of it."""
+    started = []
+
+    class FakeThread:
+        def __init__(self, target=None, daemon=None, name=None):
+            self.t, self.n = target, name
+
+        def start(self):
+            started.append(self.n or getattr(self.t, "__name__", "?"))
+    with mock.patch.object(addon.threading, "Thread", FakeThread), \
+         mock.patch.object(addon, "ThreadingHTTPServer") as srv, \
+         mock.patch.dict(addon.os.environ, {"BPX_PREWARM": "1"}):
+        srv.return_value.serve_forever.side_effect = KeyboardInterrupt
+        addon.main()
+    assert "prewarm" in started, started
+    assert started.index("_keepalive_loop") < started.index("prewarm"), started
+
+
+def test_catalog_source_rejects_path_injection():
+    u, _ = addon.catalog_source("bpx-latest", "movie", "../../etc/passwd", 0)
+    assert ".." not in u and u.endswith("/genre/etcpasswd.html"), u
+
+
+def test_imdb_suggest_title_is_strict():
+    body = {"d": [{"id": "tt32378175", "l": "Haiwaan", "y": 2026, "qid": "movie"},
+                  {"id": "tt19719628", "l": "Haiwaan", "y": 2023, "qid": "movie"},
+                  {"id": "nm123", "l": "Haiwaan Actor"}]}
+
+    class R:
+        status_code = 200
+
+        def json(self):
+            return body
+    with mock.patch.object(addon._S, "get", return_value=R()):
+        assert addon.imdb_suggest_title("Haiwaan", 2026) == "tt32378175"
+        assert addon.imdb_suggest_title("Haiwaan", 2023) == "tt19719628"
+        assert addon.imdb_suggest_title("Haiwaan", 1999) is None, "year guard"
+        assert addon.imdb_suggest_title("Haiwaan", 2026, "series") is None, "qid guard"
+        assert addon.imdb_suggest_title("nm123", 2026) is None
+
+
+def test_imdb_suggest_title_mismatch_falls_through():
+    """Jaatishwar is 'The Reincarnate' on IMDb: no match is BETTER than a wrong
+    tt id (a wrong id shows another film's poster). The card then rides bpx-."""
+    body = {"d": [{"id": "tt3365690", "l": "The Reincarnate", "y": 2014, "qid": "movie"}]}
+
+    class R:
+        status_code = 200
+
+        def json(self):
+            return body
+    with mock.patch.object(addon._S, "get", return_value=R()):
+        assert addon.imdb_suggest_title("Jaatishwar", 2014) is None
+    with mock.patch.object(addon._S, "get", side_effect=RuntimeError("net")):
+        assert addon.imdb_suggest_title("Anything", 2020) is None
+
+
+def test_map_ids_falls_back_to_source_ids():
+    items = [{"slug": "harudu", "title": "Harudu", "year": 2026},
+             {"slug": "unknown-thing", "title": "Unknown Thing", "year": 2026}]
+    with mock.patch.object(addon, "imdb_suggest_title",
+                           side_effect=lambda t, y=None, c="movie":
+                           "tt33702400" if t == "Harudu" else None):
+        out = addon._map_ids(items, "movie")
+    assert out[0]["id"] == "tt33702400"
+    assert out[1]["id"] == "bpx-unknown-thing", out[1]
+
+
+def test_map_ids_never_leaves_an_item_without_an_id():
+    items = [{"slug": "a", "title": "A"}, {"slug": "b", "title": "B"}]
+    with mock.patch.object(addon, "imdb_suggest_title", side_effect=RuntimeError("x")):
+        out = addon._map_ids(items, "movie", budget=0.0)
+    assert [i["id"] for i in out] == ["bpx-a", "bpx-b"]
+
+
+def test_catalog_items_maps_listings_to_metas():
+    clear_caches()
+    with mock.patch.object(addon, "list_page", return_value=addon.parse_listing(_listing(2))), \
+         mock.patch.object(addon, "imdb_suggest_title",
+                           side_effect=lambda t, y=None, c="movie": "tt111" if t == "Title 0" else None):
+        metas = addon.catalog_items("movie", "bpx-latest")
+    assert len(metas) == 2
+    assert metas[0]["id"] == "tt111" and metas[0]["name"] == "Title 0"
+    assert metas[0]["poster"].endswith("100.jpg") and metas[0]["year"] == 2026
+    assert metas[0]["imdbRating"] == "7.5"
+    assert metas[0]["posterShape"] == "poster"
+    # unmapped -> source id + the watch URL so the client can still resolve it
+    assert metas[1]["id"] == "bpx-title-1" and metas[1]["bpxSource"].endswith("title-1.html")
+
+
+def test_catalog_items_splits_movies_from_series():
+    clear_caches()
+    mixed = addon.parse_listing(_listing(2)) + addon.parse_listing(_listing(2, series=True))
+    with mock.patch.object(addon, "list_page", return_value=mixed), \
+         mock.patch.object(addon, "imdb_suggest_title", return_value=None):
+        movies = addon.catalog_items("movie", "bpx-latest")
+        series = addon.catalog_items("series", "bpx-latest")
+    assert len(movies) == 2 and len(series) == 2
+    assert all(m["id"].startswith("bpx-") for m in movies)
+
+
+def test_catalog_items_home_slices_by_skip():
+    """the homepage is ONE big page: skip must slice the cached listing, not
+    re-fetch it (the page is ~375 KB)."""
+    clear_caches()
+
+    class R:
+        status_code = 200
+        text = _listing(5)
+    hits = []
+    with mock.patch.object(addon, "_get",
+                           side_effect=lambda u, **k: hits.append(u) or R()), \
+         mock.patch.object(addon, "imdb_suggest_title", return_value=None):
+        p1 = addon.catalog_items("movie", "bpx-latest", skip=0)
+        p2 = addon.catalog_items("movie", "bpx-latest", skip=3)
+    assert [m["name"] for m in p1] == ["Title %d" % i for i in range(5)]
+    assert [m["name"] for m in p2] == ["Title 3", "Title 4"]
+    assert len(hits) == 1, "one fetch, two slices (got %r)" % hits
+
+
+def test_catalog_items_search_uses_autocomplete():
+    clear_caches()
+    cands = [{"title": "Mirzapur", "url": "https://banglaplex.biz/watch/mirzapur.html",
+              "type": "Movie", "image": "https://x/1.jpg"},
+             {"title": "Mirzapur 2024 Web Series", "type": "TV Series",
+              "url": "https://banglaplex.biz/watch/mirzapur-2024.html", "image": ""}]
+    with mock.patch.object(addon, "_search_autocomplete", return_value=cands), \
+         mock.patch.object(addon, "imdb_suggest_title", return_value=None):
+        mov = addon.catalog_items("movie", "bpx-latest", search="mirzapur")
+        ser = addon.catalog_items("series", "bpx-latest", search="mirzapur")
+    assert [m["id"] for m in mov] == ["bpx-mirzapur"]
+    assert [m["id"] for m in ser] == ["bpx-mirzapur-2024"]
+
+
+def test_catalog_items_transient_search_is_empty_not_cached():
+    clear_caches()
+    with mock.patch.object(addon, "_search_autocomplete", return_value=None):
+        assert addon.catalog_items("movie", "bpx-latest", search="x") == []
+    with mock.patch.object(addon, "_search_autocomplete",
+                           return_value=[{"title": "X", "type": "Movie",
+                                          "url": "https://banglaplex.biz/watch/x.html",
+                                          "image": ""}]), \
+         mock.patch.object(addon, "imdb_suggest_title", return_value=None):
+        assert len(addon.catalog_items("movie", "bpx-latest", search="x")) == 1
+
+
+def test_catalog_items_dead_listing_is_not_cached_as_empty_forever():
+    clear_caches()
+    with mock.patch.object(addon, "list_page", return_value=None):
+        assert addon.catalog_items("movie", "bpx-latest") == []
+
+
+def test_http_catalog_route():
+    clear_caches()
+    with mock.patch.object(addon, "catalog_items",
+                           return_value=[{"id": "tt1", "type": "movie", "name": "X"}]) as ci:
+        c = _http_get("/catalog/movie/bpx-latest.json?genre=action&skip=24")
+    assert c["code"] == 200
+    assert _json_body(c)["metas"][0]["id"] == "tt1"
+    assert ci.call_args[0][2] == "action" and ci.call_args[0][4] == 24
+
+
+def test_http_catalog_route_path_extras():
+    with mock.patch.object(addon, "catalog_items", return_value=[]) as ci:
+        c = _http_get("/catalog/movie/bpx-latest/genre=comedy;skip=48.json")
+    assert c["code"] == 200
+    assert ci.call_args[0][2] == "comedy" and ci.call_args[0][4] == 48
+
+
+def test_http_catalog_unknown_id_404():
+    assert _http_get("/catalog/movie/nope.json")["code"] == 404
+    assert _http_get("/catalog/other/bpx-latest.json")["code"] == 404
+
+
+# ══════════════════════════════════════ 15c. meta (source fallback) + config
+_PAGE_FIX = {"slug": "harudu", "title": "Harudu", "year": 2026,
+             "release": "2026-01-10", "duration": "128", "quality": "WEB-DL",
+             "genre": "Action, Drama", "country": "India",
+             "actors": "Venkat, Hebah Patel", "director": "Someone",
+             "poster": "https://banglaplex.biz/uploads/video_thumb/9.jpg",
+             "plot": "A man returns home.", "keys": [("k", True, "Full Movie")],
+             "iframe": "https://plextream.work/embed.php?id=1",
+             "url": "https://banglaplex.biz/watch/harudu.html"}
+
+
+def test_meta_from_page_exposes_every_source_field():
+    m = addon.meta_from_page(_PAGE_FIX, "movie")
+    assert m["id"] == "bpx-harudu" and m["type"] == "movie"
+    assert m["name"] == "Harudu" and m["year"] == 2026
+    assert m["poster"].endswith("9.jpg") and m["background"] == m["poster"]
+    assert m["description"] == "A man returns home."
+    assert m["genres"] == ["Action", "Drama"] and m["cast"] == ["Venkat", "Hebah Patel"]
+    assert m["director"] == "Someone" and m["country"] == "India"
+    assert m["runtime"] == "2h08m" and m["released"] == "2026-01-10"
+    assert m["bpxSlug"] == "harudu"
+
+
+def test_meta_from_page_never_crashes_on_a_bare_page():
+    m = addon.meta_from_page({"slug": "x", "title": "X"}, "movie")
+    assert m["name"] == "X" and "poster" not in m
+    assert addon.meta_from_page(None, "movie") is None
+
+
+def test_build_meta_uses_providers_when_they_are_complete():
+    clear_caches()
+    full = {"name": "Harudu", "poster": "https://img/tmdb.jpg",
+            "description": "A rich synopsis", "year": 2026, "genres": ["Action"]}
+    with mock.patch.object(addon, "_cinemeta_full", return_value=full), \
+         mock.patch.object(addon, "_site_meta_for",
+                           side_effect=AssertionError("source must not be scraped")):
+        m = addon.build_meta("movie", "tt33702400")
+    assert m["poster"] == "https://img/tmdb.jpg" and m["id"] == "tt33702400"
+
+
+def test_build_meta_falls_back_to_the_source_for_holes():
+    """the user's rule: when TMDB/IMDb/Cinemeta have nothing, the SOURCE must
+    still describe the card — a catalog item is never a blank shell."""
+    clear_caches()
+    thin = {"name": "Harudu", "poster": "", "description": ""}
+    with mock.patch.object(addon, "_cinemeta_full", return_value=thin), \
+         mock.patch.object(addon, "_tmdb_full", return_value=None), \
+         mock.patch.object(addon, "_site_meta_for",
+                           return_value=addon.meta_from_page(_PAGE_FIX, "movie")):
+        m = addon.build_meta("movie", "tt33702400")
+    assert m["name"] == "Harudu"                       # provider name wins
+    assert m["poster"].endswith("9.jpg"), m            # source fills the hole
+    assert m["description"] == "A man returns home."
+    assert m["genres"] == ["Action", "Drama"]
+
+
+def test_build_meta_when_no_provider_knows_the_title():
+    clear_caches()
+    with mock.patch.object(addon, "_cinemeta_full", return_value=None), \
+         mock.patch.object(addon, "_tmdb_full", return_value=None), \
+         mock.patch.object(addon, "_site_meta_for",
+                           return_value=addon.meta_from_page(_PAGE_FIX, "movie")):
+        m = addon.build_meta("movie", "tt9999999")
+    assert m["name"] == "Harudu" and m["poster"].endswith("9.jpg")
+
+
+def test_build_meta_source_only_id():
+    clear_caches()
+    with mock.patch.object(addon, "parse_watch_page", return_value=_PAGE_FIX), \
+         mock.patch.object(addon, "_cinemeta_full",
+                           side_effect=AssertionError("providers must not be asked")):
+        m = addon.build_meta("movie", "bpx-harudu")
+    assert m["id"] == "bpx-harudu" and m["name"] == "Harudu"
+    with mock.patch.object(addon, "parse_watch_page", return_value=None):
+        assert addon.build_meta("movie", "bpx-gone") is None
+
+
+def test_build_meta_caches_and_never_caches_a_miss_forever():
+    clear_caches()
+    calls = []
+    with mock.patch.object(addon, "_cinemeta_full",
+                           side_effect=lambda *a, **k: calls.append(1) or
+                           {"name": "X", "poster": "p", "description": "d"}):
+        addon.build_meta("movie", "tt1")
+        addon.build_meta("movie", "tt1")
+    assert len(calls) == 1
+    with mock.patch.object(addon, "_cinemeta_full", return_value=None), \
+         mock.patch.object(addon, "_tmdb_full", return_value=None), \
+         mock.patch.object(addon, "_site_meta_for", return_value=None):
+        assert addon.build_meta("movie", "tt2") is None
+
+
+def test_normalize_meta_one_shape_from_every_source():
+    """Cinemeta sends director as a list and no year (only releaseInfo); the site
+    sends comma strings. Stremio renders a blank line for anything unshaped."""
+    m = addon.normalize_meta({"name": "X", "releaseInfo": "2026",
+                              "director": ["Priyadarshan"], "cast": "A, B",
+                              "genres": "Action, Drama", "country": ["India"],
+                              "description": "  a   b  ", "poster": ""})
+    assert m["year"] == 2026 and m["releaseInfo"] == "2026"
+    assert m["director"] == "Priyadarshan"
+    assert m["cast"] == ["A", "B"] and m["genres"] == ["Action", "Drama"]
+    assert m["country"] == "India" and m["description"] == "a b"
+    assert "poster" not in m, "empty fields must not ship"
+
+
+def test_normalize_meta_keeps_provider_year_and_caps_cast():
+    m = addon.normalize_meta({"year": 2014, "cast": ["a%d" % i for i in range(40)]})
+    assert m["year"] == 2014 and len(m["cast"]) == 20
+    assert addon.normalize_meta(None) is None and addon.normalize_meta({}) == {}
+
+
+def test_build_meta_ships_a_year_for_cinemeta_shapes():
+    clear_caches()
+    with mock.patch.object(addon, "_cinemeta_full",
+                           return_value={"name": "X", "poster": "p",
+                                         "description": "d", "releaseInfo": "2026"}):
+        m = addon.build_meta("movie", "tt1234567")
+    assert m["year"] == 2026
+
+
+def test_needs_site_only_for_visible_holes():
+    assert addon._needs_site(None) is True
+    assert addon._needs_site({"poster": "p"}) is True
+    assert addon._needs_site({"description": "d"}) is True
+    assert addon._needs_site({"poster": "p", "description": "d"}) is False
+
+
+def test_tmdb_key_validation():
+    class R:
+        def __init__(s, c): s.status_code = c
+    with mock.patch.object(addon._S, "get", return_value=R(200)):
+        assert addon.validate_tmdb_key("8" * 32) is True
+    with mock.patch.object(addon._S, "get", return_value=R(401)):
+        assert addon.validate_tmdb_key("8" * 32) is False
+    assert addon.validate_tmdb_key("short") is False
+    assert addon.validate_tmdb_key("") is False
+    assert addon.validate_tmdb_key(None) is False
+
+
+# ── config ───────────────────────────────────────────────────────────────────
+def test_cfg_roundtrip_and_defaults():
+    assert addon.cfg_pack(addon.CFG_DEFAULTS) == ""
+    seg = addon.cfg_pack({"n": 1, "q": "1080", "subs": "bn,hi", "cdn": "cf",
+                          "cat": "series", "tmdb": "8" * 32})
+    assert seg and "/" not in seg and "+" not in seg and "=" not in seg, seg
+    back = addon.cfg_unpack(seg)
+    assert back["n"] == 1 and back["q"] == "1080" and back["subs"] == "bn,hi"
+    assert back["cdn"] == "cf" and back["cat"] == "series" and back["tmdb"] == "8" * 32
+
+
+def test_cfg_unpack_rejects_garbage_but_accepts_empty():
+    assert addon.cfg_unpack("") == addon.CFG_DEFAULTS
+    assert addon.cfg_unpack("!!!notbase64!!!") is None
+    good = addon.base64.urlsafe_b64encode(b"[1,2,3]").decode().rstrip("=")
+    assert addon.cfg_unpack(good) is None, "a non-object payload is not a config"
+
+
+def test_cfg_unpack_clamps_and_ignores_unknown_keys():
+    seg = addon.base64.urlsafe_b64encode(
+        b'{"n":99,"q":"8k","cdn":"nope","cat":"movie","evil":"rm -rf","subs":"OFF"}'
+    ).decode().rstrip("=")
+    cfg = addon.cfg_unpack(seg)
+    assert cfg["n"] == addon.MAX_CARDS, "cards clamp to the server maximum"
+    assert cfg["q"] == "all" and cfg["cdn"] == "both"
+    assert cfg["cat"] == "movie" and cfg["subs"] == "off"
+    assert "evil" not in cfg
+
+
+def test_cfg_rejects_a_key_that_is_not_a_key():
+    seg = addon.base64.urlsafe_b64encode(
+        b'{"tmdb":"http://evil.example/x?a=b&c=d"}').decode().rstrip("=")
+    assert addon.cfg_unpack(seg)["tmdb"] == ""
+
+
+def test_apply_cfg_caps_cards_and_strips_markers():
+    cards = []
+    for i, (cdn, res) in enumerate([("tiktok", "1080p"), ("cf", "1080p"),
+                                    ("tiktok", "720p"), ("cf", "480p")]):
+        c = _card("c%d" % i)
+        c.update({"_cdn": cdn, "_res": res, "_tier": "FHD", "_nsubs": 0})
+        cards.append(c)
+    out = addon.apply_cfg(cards, {"n": 2, "subs": "en", "q": "all", "cdn": "both"})
+    assert len(out) == 2
+    assert not any(k.startswith("_") for c in out for k in c), "markers must not ship"
+    assert len(addon.apply_cfg(cards, {"n": 1, "subs": "en", "q": "all",
+                                       "cdn": "both"})) == 1
+
+
+def test_apply_cfg_quality_floor():
+    def mk(res):
+        c = _card(res)
+        c.update({"_cdn": "tiktok", "_res": res, "_tier": "", "_nsubs": 0})
+        return c
+    cards = [mk("1080p"), mk("720p"), mk("480p")]
+    assert [c["name"] for c in
+            addon.apply_cfg(cards, {"n": 9, "subs": "en", "q": "1080", "cdn": "both"})
+            ] == ["1080p"]
+    assert len(addon.apply_cfg(cards, {"n": 9, "subs": "en", "q": "720",
+                                       "cdn": "both"})) == 2
+    assert len(addon.apply_cfg(cards, {"n": 9, "subs": "en", "q": "all",
+                                       "cdn": "both"})) == 3
+
+
+def test_apply_cfg_quality_floor_keeps_unmeasured_cards():
+    """a card whose resolution could not be measured must not be silently
+    dropped by a quality filter (that would look like a dead title)."""
+    c = _card("unknown-res")
+    c.update({"_cdn": "cf", "_res": "HDTC", "_tier": "", "_nsubs": 0})
+    out = addon.apply_cfg([c], {"n": 9, "subs": "en", "q": "1080", "cdn": "both"})
+    assert len(out) == 1
+
+
+def test_apply_cfg_cdn_preference():
+    def mk(cdn):
+        c = _card(cdn)
+        c.update({"_cdn": cdn, "_res": "1080p", "_tier": "", "_nsubs": 0})
+        return c
+    cards = [mk("tiktok"), mk("cloudflare")]
+    assert [c["name"] for c in
+            addon.apply_cfg(cards, {"n": 9, "subs": "en", "q": "all", "cdn": "tiktok"})
+            ] == ["tiktok"]
+    assert [c["name"] for c in
+            addon.apply_cfg(cards, {"n": 9, "subs": "en", "q": "all", "cdn": "cf"})
+            ] == ["cloudflare"]
+    assert len(addon.apply_cfg(cards, {"n": 9, "subs": "en", "q": "all",
+                                       "cdn": "both"})) == 2
+
+
+def test_apply_cfg_cdn_preference_falls_back_instead_of_empting():
+    """asking for a server the title does not have must not look like a dead
+    title — the other server is still a perfectly good card."""
+    c = _card("only-cf")
+    c.update({"_cdn": "cloudflare", "_res": "1080p", "_tier": "", "_nsubs": 0})
+    out = addon.apply_cfg([c], {"n": 9, "subs": "en", "q": "all", "cdn": "tiktok"})
+    assert [x["name"] for x in out] == ["only-cf"]
+
+
+def test_apply_cfg_subtitle_preference_and_off():
+    c = _card("s")
+    c["subtitles"] = [{"lang": "ta", "url": "u1"}, {"lang": "en", "url": "u2"},
+                      {"lang": "bn", "url": "u3"}]
+    c["description"] = "x / ⟡ 3 SUB"
+    c.update({"_cdn": "tiktok", "_res": "1080p", "_tier": "", "_nsubs": 3})
+    out = addon.apply_cfg([dict(c)], {"n": 9, "subs": "bn,en", "q": "all", "cdn": "both"})
+    assert [s["lang"] for s in out[0]["subtitles"]] == ["bn", "en"]
+    assert "⟡ 2 SUB" in out[0]["description"]
+    off = addon.apply_cfg([dict(c)], {"n": 9, "subs": "off", "q": "all", "cdn": "both"})
+    assert "subtitles" not in off[0]
+
+
+def test_apply_cfg_does_not_mutate_the_cached_card():
+    c = _card("x")
+    c.update({"_cdn": "tiktok", "_res": "1080p", "_tier": "", "_nsubs": 0,
+              "subtitles": [{"lang": "ta", "url": "u"}]})
+    addon.apply_cfg([c], {"n": 1, "subs": "off", "q": "all", "cdn": "both"})
+    assert "_cdn" in c and c["subtitles"], "the shared cache must stay intact"
+
+
+def test_manifest_follows_the_catalog_config():
+    assert len(addon.manifest({"cat": "all"})["catalogs"]) == 3
+    assert [c["id"] for c in addon.manifest({"cat": "series"})["catalogs"]] == ["bpx-series"]
+    assert [c["id"] for c in addon.manifest({"cat": "movie"})["catalogs"]] == \
+        ["bpx-latest", "bpx-year"]
+    off = addon.manifest({"cat": "off"})
+    assert off["catalogs"] == [] and "catalog" not in off["resources"]
+    assert addon.manifest()["version"] == addon.VERSION
+
+
+def test_http_config_segment_routes_every_resource():
+    seg = addon.cfg_pack({"n": 1, "cat": "series"})
+    d = _json_body(_http_get("/%s/manifest.json" % seg))
+    assert [c["id"] for c in d["catalogs"]] == ["bpx-series"]
+    with mock.patch.object(addon, "build_streams",
+                           return_value={"streams": [_card("a"), _card("b")]}):
+        n = len(_json_body(_http_get("/%s/stream/movie/tt0213890.json" % seg))["streams"])
+    assert n == 1
+
+
+def test_http_bad_config_segment_404s():
+    assert _http_get("/!!!/manifest.json")["code"] == 404
+
+
+def test_http_configure_page_is_self_contained():
+    c = _http_get("/configure")
+    assert c["code"] == 200 and c["headers"]["Content-Type"].startswith("text/html")
+    body = c["body"].decode()
+    assert "<script" in body and "<style" in body
+    for needle in ('id="tmdb"', 'id="cat"', 'id="q"', 'id="cdn"', 'id="subs"',
+                   "Install in Stremio", "stremio://"):
+        assert needle in body, needle
+    # no third-party asset: the page must render inside Stremio's webview
+    assert "http://fonts" not in body and "cdn.jsdelivr" not in body
+    assert addon.VERSION in body
+
+
+def test_http_validate_key_route():
+    with mock.patch.object(addon, "validate_tmdb_key", return_value=True):
+        assert _json_body(_http_get("/validate-key?key=%s" % ("8" * 32))) == {"valid": True}
+    with mock.patch.object(addon, "validate_tmdb_key", return_value=False):
+        assert _json_body(_http_get("/validate-key?key=bad")) == {"valid": False}
+
+
+def test_http_meta_route():
+    with mock.patch.object(addon, "build_meta",
+                           return_value={"id": "tt1", "type": "movie", "name": "X"}):
+        d = _json_body(_http_get("/meta/movie/tt1111111.json"))
+    assert d["meta"]["name"] == "X"
+    with mock.patch.object(addon, "build_meta", return_value=None):
+        assert _json_body(_http_get("/meta/movie/bpx-nope.json")) == {"meta": {}}
+
+
+def test_http_meta_route_strips_series_season_suffix():
+    with mock.patch.object(addon, "build_meta", return_value={"id": "tt1"}) as bm:
+        _http_get("/meta/series/tt1111111:2:5.json")
+    assert bm.call_args[0][1] == "tt1111111", bm.call_args
+
+
+def test_http_stream_accepts_source_ids():
+    with mock.patch.object(addon, "build_streams",
+                           return_value={"streams": [_card()]}) as bs:
+        c = _http_get("/stream/movie/bpx-harudu.json")
+    assert c["code"] == 200 and bs.call_args[0][1] == "bpx-harudu"
+    assert _http_get("/stream/movie/nope.json")["code"] == 404
+
+
+def test_build_inner_source_id_skips_the_metadata_hop():
+    """a bpx- card has no IMDb/TMDB entry by definition: going straight to the
+    watch page is both faster and the only thing that can work."""
+    clear_caches()
+    with mock.patch.object(addon, "resolve_meta_all",
+                           side_effect=AssertionError("must not be called")), \
+         mock.patch.object(addon, "search_candidates",
+                           side_effect=AssertionError("must not be called")), \
+         mock.patch.object(addon, "parse_watch_page", return_value=_PAGE_FIX), \
+         _stub_resolve([_card()]):
+        out = addon._build_inner("movie", "bpx-harudu", None, None, time.time() + 5)
+    assert len(out["streams"]) == 1
+
+
+def test_build_inner_source_id_honest_when_unplayable():
+    clear_caches()
+    with mock.patch.object(addon, "parse_watch_page", return_value=_PAGE_FIX), \
+         mock.patch.object(addon, "_resolve_file", return_value=[]):
+        out = addon._build_inner("movie", "bpx-harudu", None, None, time.time() + 5)
+    assert out["streams"] == [] and "no playable" in out["message"]
+
+
+def test_health_reports_the_new_surfaces():
+    d = _json_body(_http_get("/health"))
+    assert ("movie", "bpx-latest") in [tuple(x) for x in d["catalogs"]]
+    assert d["configurable"] is True
+    assert {c["name"] for c in d["caches"]} >= {"listings", "imdbmap", "metares"}
 
 
 # ═════════════════════════════════════════════ 16. zero-bandwidth contract
