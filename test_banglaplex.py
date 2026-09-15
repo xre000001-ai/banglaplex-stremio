@@ -3770,6 +3770,16 @@ def test_known_cross_type_shelf_card_keeps_the_provider_slug():
     assert out[0]["id"] == "bpx-kuheli"
 
 
+def test_movie_search_always_uses_the_exact_provider_slug_when_type_is_untrusted():
+    clear_caches()
+    cand = {"title": "Kuheli", "type": "Movie",
+            "url": "https://banglaplex.biz/watch/kuheli.html", "image": ""}
+    with mock.patch.object(addon, "_search_autocomplete", return_value=[cand]), \
+         mock.patch.object(addon, "imdb_suggest_title", return_value="tt7222514"):
+        out = addon.catalog_items("movie", "bpx-latest", search="Kuheli")
+    assert out[0]["id"] == "bpx-kuheli", "never guess the old same-title IMDb movie"
+
+
 def test_catalog_search_marks_badged_cross_type_hits_as_source_ids():
     clear_caches()
     addon._note_kind("kuheli", True)

@@ -188,7 +188,11 @@ a type match, then everything else — and nothing is ever dropped, because both
 plays while a dropped one is a dead end. The one reliable type signal is the
 listing grid's `label-tvseries` badge, so browsing a shelf teaches a bounded
 `_SLUG_KIND` index that search consults; the browse path already filtered on that
-badge and is unchanged.
+badge and is unchanged. For **movie-shelf search** specifically, the provider slug
+is always used instead of guessing an IMDb movie: autocomplete has no reliable
+year and its type is constant, so a source id is safer than turning a 2026 series
+into an older same-title film. Browse cards still get strict IMDb ids when the
+listing has a real year/type match.
 
 Every card gets an id: an **IMDb `tt…`** when a suggestion matches title *and*
 year *and* type strictly, otherwise **`bpx-<slug>`**, a source id this addon can
@@ -390,7 +394,7 @@ instance or an external monitor (for example, a 5–10 minute health check).
 ## Tests
 
 ```bash
-python3 test_banglaplex.py           # 272 offline tests, every network call mocked
+python3 test_banglaplex.py           # 273 offline tests, every network call mocked
 BPX_LIVE=1 python3 test_banglaplex.py # + 4 live integration tests (real site/CDN)
 ```
 

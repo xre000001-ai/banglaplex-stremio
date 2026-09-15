@@ -51,7 +51,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.7.1"
+VERSION    = "1.7.2"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -3138,6 +3138,13 @@ def _map_ids(items, ctype, budget=14.0):
         site_series = it.get("series")
         if known is None and slug in _SLUG_KIND:
             known, site_series = True, _SLUG_KIND.get(slug)
+        if it.get("_from_search") and ctype == "movie":
+            # Search autocomplete has no trustworthy year and calls every hit
+            # Movie. Keep the provider slug for movie-shelf search results; a
+            # source id is exact, streamable and metadata-safe, while a guessed
+            # IMDb movie can be an older same-title film (Kuheli).
+            it["id"] = "bpx-" + slug
+            continue
         if known and bool(site_series) != (ctype == "series"):
             # Never manufacture a cross-type IMDb id. The provider slug is the
             # authoritative source mapping for this card.
@@ -3191,7 +3198,7 @@ def catalog_items(ctype, cat_id, genre=None, search=None, skip=0, cfg=None):
             it = {"slug": slug, "url": c["url"], "title": c["title"],
                   "poster": c.get("image") or "", "year": _year_of(c["title"]),
                   "quality": "", "series": bool(kind), "rating": 0.0,
-                  "_kind_known": kind_known}
+                  "_kind_known": kind_known, "_from_search": True}
             # Rank, never filter. The autocomplete `type` says Movie for real
             # series, so a hard filter emptied the series shelf's search for every
             # query — "Prem Shots is on the site but the addon doesn't show it".
