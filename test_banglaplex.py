@@ -2380,7 +2380,7 @@ def test_parse_listing_teaches_the_slug_kind_index():
     assert [i["slug"] for i in items] == ["title-0", "title-1"]
     assert addon._SLUG_KIND["title-0"] is True and addon._SLUG_KIND["title-1"] is True
     addon.parse_listing(_listing(1, series=False))
-    assert addon._SLUG_KIND["title-0"] is False, "the latest badge wins"
+    assert addon._SLUG_KIND["title-0"] is True, "badge absence cannot erase positive evidence"
 
     clear_caches()
     addon._note_kind("known-series", True)
@@ -2393,6 +2393,13 @@ def test_parse_listing_teaches_the_slug_kind_index():
         ser = addon.catalog_items("series", "bpx-series", search="x")
     assert [m["name"] for m in ser] == ["Wrong Label", "Unknown"]
     assert ser[0]["id"] == "bpx-known-series"
+
+
+def test_slug_kind_positive_badge_survives_a_badgeless_repeat():
+    clear_caches()
+    addon._note_kind("kuheli", True)
+    addon._note_kind("kuheli", False)       # homepage repeats it without TV badge
+    assert addon._SLUG_KIND["kuheli"] is True
 
 
 def test_slug_kind_index_is_bounded():

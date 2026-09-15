@@ -390,7 +390,7 @@ instance or an external monitor (for example, a 5–10 minute health check).
 ## Tests
 
 ```bash
-python3 test_banglaplex.py           # 271 offline tests, every network call mocked
+python3 test_banglaplex.py           # 272 offline tests, every network call mocked
 BPX_LIVE=1 python3 test_banglaplex.py # + 4 live integration tests (real site/CDN)
 ```
 

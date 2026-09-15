@@ -51,7 +51,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.7.0"
+VERSION    = "1.7.1"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -2841,7 +2841,9 @@ _SLUG_KIND_MAX = 4000
 def _note_kind(slug, is_series):
     """Remember how the SITE classified a title, from its `label-tvseries` badge.
 
-    The autocomplete endpoint's own `type` field is worthless as a classifier:
+    A present TV badge is positive evidence; badge absence is not negative evidence
+    because the homepage repeats some series cards without the badge. Keep True
+    once learned. The autocomplete endpoint's own `type` field is worthless as a classifier:
     measured on Dahan, Queens, Taarkata, Cactus, Gorki-R Ma and Prem Shots — all of
     which sit on the site's series shelf — it answered `Movie` for every single
     one. Search used to hard-filter on that field, so the series shelf's search box
@@ -2851,7 +2853,11 @@ def _note_kind(slug, is_series):
         return
     if len(_SLUG_KIND) >= _SLUG_KIND_MAX and slug not in _SLUG_KIND:
         _SLUG_KIND.clear()
-    _SLUG_KIND[slug] = bool(is_series)
+    # Badge-present is positive evidence. Some homepage/movie layouts repeat a
+    # series card without the badge, so a later False must not erase a learned
+    # True (Kuheli is the measured case).
+    old = _SLUG_KIND.get(slug)
+    _SLUG_KIND[slug] = bool(is_series) or bool(old)
 
 
 def parse_listing(h):
