@@ -9,6 +9,7 @@ really hits banglaplex.biz, plextream.work, the 3n1 frontends and the CDNs, so i
 is rate-limit sensitive; never run it in a loop.
 """
 import io
+import base64
 import json
 import os
 import re
@@ -25,6 +26,24 @@ PASS = 0
 FAIL = 0
 
 
+def _quiesce(timeout=8.0):
+    """Wait for every executor to drain before the next test starts.
+
+    A test that races providers or resolves in the background leaves futures
+    running after its `with mock.patch(...)` block exits; those threads then make
+    real `_S.get` calls *during the next test*, which is how
+    `test_net_probe_reports_both_paths` and `test_fetch_walks_exits_until_one_works`
+    came to fail intermittently (measured polluters: test_build_meta_uses_providers_*,
+    test_build_meta_ships_a_year_*, test_http_gzip). ThreadPoolExecutor is FIFO, so
+    a sentinel submitted now is guaranteed to run after everything queued so far."""
+    import concurrent.futures as cf
+    for ex in (addon._IO_EX, addon._V_EX, addon._BUILD_EX, addon._PP_EX, addon._P_EX):
+        try:
+            cf.wait([ex.submit(lambda: None)], timeout=timeout)
+        except Exception:
+            pass
+
+
 def run(test):
     global PASS, FAIL
     name = test.__name__
@@ -37,12 +56,14 @@ def run(test):
         import traceback
         print("FAIL  %s: %s" % (name, e))
         traceback.print_exc()
+    finally:
+        _quiesce()
 
 
 def clear_caches():
     for c in (addon.C_SEARCH, addon.C_PAGE, addon.C_META, addon.C_EMBED,
               addon.C_N1, addon.C_STREAM, addon.C_LIST, addon.C_IMDB,
-              addon.C_METARES, addon.C_SLUG):
+              addon.C_METARES, addon.C_SLUG, addon.C_ABYSS):
         c.clear()
         c.bytes = 0
     addon.C_STALE.clear()
@@ -886,6 +907,24 @@ def test_format_card_omits_tokens_it_has_no_data_for():
     assert "SUB" not in c["description"] and "⌬ TikTok CDN" in c["description"]
 
 
+def test_card_shows_a_media_size_and_never_a_playlist_size():
+    """_master_info's byte count is the length of the PLAYLIST, so rendering it as
+    the video's size made a 1080p feature advertise "▤ 323 B". Only a real media
+    byte count (the abyss origin reports one) may reach that slot."""
+    pl = {"best": (1920, 1080), "n_variants": 2, "variant": "v", "text": TT_MASTER,
+          "pl_bytes": 323, "size": 323}          # `size` here means playlist bytes
+    c = addon.format_card("tiktok", "https://x/m.m3u8", None, "TikTok CDN", pl,
+                          _page(_ctype="movie"), PAYLOAD)
+    assert "▤" not in c["description"], c["description"]
+    assert "♧ FHD 1080p" in c["name"]
+
+    ab = {"best": (0, 0), "label": "1080p", "media_size": 2844976106,
+          "codec": "avc1", "seekable": True, "probe": 200}
+    c2 = addon.format_card("abyss", "https://njuaynwkh47.sssrr.org/sora/x",
+                           addon.ABYSS_REFERER, "Abyss", ab, _page(_ctype="movie"), {})
+    assert "▤ 2.65 GB" in c2["description"], c2["description"]
+
+
 def test_format_card_falls_back_to_site_quality_and_default_audio():
     info = {"best": (0, 0), "n_variants": 0, "size": 0, "variant": "", "text": ""}
     c = addon.format_card("tiktok", "https://x/m.m3u8", None, "s", info,
@@ -1076,11 +1115,11 @@ def test_build_inner_messages_are_honest():
         assert "no playable/verified source" in m, m
 
 
-def test_resolve_file_skips_unsupported_and_dead_players():
-    """abyss (SoTrym, uncracked) and bestx/chillx (TLS-dead) => honest empty,
-    never a guessed card."""
+def test_resolve_file_skips_dead_players():
+    """bestx/chillx (TLS-dead) and no-iframe => honest empty, never a guessed
+    card. Abyss used to be in this list; it is a real source now."""
     clear_caches()
-    for iframe in ("https://abyssplayer.com/UpjbDHK5N", "https://bestx.stream/v/xee2VgCLScFN/",
+    for iframe in ("https://bestx.stream/v/xee2VgCLScFN/",
                    "https://chillx.top/v/abc/", ""):
         page = {"url": "https://banglaplex.biz/watch/x.html", "title": "X", "year": 2024,
                 "keys": [("k", True, "Full Movie")], "iframe": iframe}
@@ -1502,16 +1541,27 @@ def test_fetch_falls_back_to_pool_on_403_in_the_same_call():
 
 def test_fetch_walks_exits_until_one_works():
     _pool_reset()
-    seq = [_resp(403, ""), RuntimeError("dead exit"), _resp(200, "ok")]
 
     def fake(u, **k):
-        if k.get("proxies") is None:
+        """Answer per EXIT rather than per call order: a background thread from an
+        earlier test can land in this mock, and a pop-order sequence would then
+        hand the wrong answer to the wrong exit (this test failed intermittently
+        for exactly that reason)."""
+        px = k.get("proxies")
+        if px is None:
             raise RuntimeError("direct down")
-        v = seq.pop(0)
-        if isinstance(v, Exception):
-            raise v
-        return v
-    with mock.patch.object(addon._S, "get", side_effect=fake):
+        host = px.get("http")
+        if host == "http://1.1.1.1:8080":
+            return _resp(403, "")                # blocked -> bench and move on
+        if host == "http://2.2.2.2:8080":
+            raise RuntimeError("dead exit")      # transport failure -> move on
+        return _resp(200, "ok")                  # 3.3.3.3 is the one that works
+    with mock.patch.object(addon._S, "get", side_effect=fake), \
+         mock.patch.object(addon, "_pool_order",
+                           return_value=["http://1.1.1.1:8080", "http://2.2.2.2:8080",
+                                         "http://3.3.3.3:8080"]):
+        # _pool_order is pinned because a trainer thread left over from an earlier
+        # test can republish the pool mid-flight and empty it under us
         r, via = addon._fetch("https://banglaplex.biz/x")
     assert via is True and r.status_code == 200
     assert len(addon._POOL_BAD) >= 1
@@ -1576,7 +1626,12 @@ def test_net_probe_reports_both_paths():
     row = d["probes"]["site_home"]
     assert row["direct"][0] == 403
     assert row["proxy"][0] == 200, row["proxy"]
-    assert len(seen) == 4, "the probe must race every exit, not just one: %r" % seen
+    # the intent is "race every exit, not just one" — assert that as a set, since
+    # a background thread from an earlier test can add calls of its own
+    assert None in seen, "the direct path must be probed too: %r" % seen
+    raced = {p["http"] for p in seen if p}
+    assert raced == {"http://1.1.1.1:8080", "http://2.2.2.2:8080",
+                     "http://3.3.3.3:8080"}, "must race every exit: %r" % seen
     assert d["pool"]["pool"] == 3
 
 
@@ -1592,10 +1647,64 @@ def test_pool_drops_socks_exits():
     assert out == ["http://1.2.3.4:8080", "https://5.6.7.8:8443"], out
 
 
-def test_pool_get_races_exits_and_keeps_first_good():
+def test_pool_get_closes_a_loser_that_finished_before_the_winner():
+    """reap() only closes once `win` is set, so a racer whose future was already
+    done when the callbacks were attached never got closed: its socket stayed open
+    for the life of the process. Running the racers inline makes every future
+    complete first, which is exactly that ordering. `as_completed` yields
+    already-done futures in set order, so WHICH answer wins is arbitrary — the
+    invariant is that the loser is closed."""
     _pool_reset()
+    closed = []
+    exits = ["http://1.1.1.1:8080", "http://2.2.2.2:8080", "http://3.3.3.3:8080"]
+
+    class Answer:
+        status_code = 200
+
+        def __init__(self, tag):
+            self.tag = tag
+            self.text = "ok"
+
+        def close(self):
+            closed.append(self.tag)
+
+    second, third = Answer("second"), Answer("third")
+
+    def fake(u, **k):
+        p = (k.get("proxies") or {}).get("http")
+        if p == "http://1.1.1.1:8080":
+            raise RuntimeError("dead exit")        # nothing to leak
+        return second if p == "http://2.2.2.2:8080" else third
+
+    import concurrent.futures as cf
+
+    class InlineEx:
+        def submit(self, fn, *a, **k):
+            f = cf.Future()
+            try:
+                f.set_result(fn(*a, **k))
+            except Exception as e:
+                f.set_exception(e)
+            return f
+
+    with mock.patch.object(addon, "_P_EX", InlineEx()), \
+         mock.patch.object(addon, "_pool_order", return_value=list(exits)), \
+         mock.patch.object(addon._S, "get", side_effect=fake):
+        r = addon._pool_get("https://x/y", {"User-Agent": "t"}, 5)
+    assert r in (second, third), r
+    assert closed == ["third" if r is second else "second"], closed
+
+
+def test_pool_get_races_exits_and_keeps_first_good():
+    """The first good answer wins and the losers are closed. The loser is held on
+    an event and released only after _pool_get has returned, so this does not
+    depend on a 0.2s sleep losing a race with the scheduler (it used to fail
+    roughly one run in four on a loaded box)."""
+    _pool_reset()
+    _quiesce()
     good = _resp(200, "ok")
     closed = []
+    hold = threading.Event()
 
     class Slow:
         status_code = 200
@@ -1606,18 +1715,23 @@ def test_pool_get_races_exits_and_keeps_first_good():
     def fake(u, **k):
         p = (k.get("proxies") or {}).get("http")
         if p == "http://1.1.1.1:8080":
-            time.sleep(0.2)
-            return Slow()                      # a LATE winner must be closed
+            hold.wait(20)                        # lands long AFTER the winner
+            return Slow()
         if p == "http://2.2.2.2:8080":
-            return good                        # first good answer wins
+            return good                          # first good answer wins
         raise RuntimeError("dead exit")
-    with mock.patch.object(addon._S, "get", side_effect=fake):
+    with mock.patch.object(addon._S, "get", side_effect=fake), \
+         mock.patch.object(addon, "_pool_order",
+                           return_value=["http://1.1.1.1:8080", "http://2.2.2.2:8080",
+                                         "http://3.3.3.3:8080"]):
         r = addon._pool_get("https://x/y", {"User-Agent": "t"}, 5)
-    assert r is good
-    for _ in range(100):                       # losers close on their own thread
-        if closed:
-            break
-        time.sleep(0.05)
+        assert r is good
+        assert closed == [], "the loser is still in flight"
+        hold.set()
+        for _ in range(200):                     # losers close on their own thread
+            if closed:
+                break
+            time.sleep(0.05)
     assert "slow" in closed, "losing racers must be closed, not leaked"
     assert addon._POOL_STATS.get("http://2.2.2.2:8080"), "the winner becomes sticky"
 
@@ -2480,6 +2594,325 @@ def test_build_inner_falls_through_when_the_slug_index_is_stale():
 
 
 # ── shelf prewarm ────────────────────────────────────────────────────────────
+# ══════════════ abyss player (SoTrym): crypto pinned against real payloads ════
+# The page below is a real abyssplayer.com embed as served for BanglaPlex's
+# "Queens" (slug eLY0XBgBP). Its media blob decrypts to a 4-source mp4 map, and
+# the token built from it was verified live: the origin answered 200/206 with
+# `ftyp isom` + moov + mdat summing to exactly the declared 2 081 695 893 bytes.
+_ABYSS_DATAS = "eyJzbHVnIjoiZUxZMFhCZ0JQIiwibWQ1X2lkIjozMDU3MDc3MSwidXNlcl9pZCI6NDI4MjczLCJtZWRpYSI6IjB8uyOPdLwnXHUwMDA0lDf0hl1cdTAwMDKNZ5WDPMb/ND3bkXf8tHB/mZeBYXNs+zDWd7aSt790uY9U2YP+K6U4PZ5QP1XtIJO9Qc5TtVx1MDAxMjImqm1xsFGuXHUwMDFkyVwi//NEXHUwMDBiuG6JwdjW6Z+u0VxitfL7NTO0IHSXXHUwMDE52Fx1MDAwYqOzQU+EujvYtalYc1x1MDAwZkqrqFx0RDivXHUwMDAzcPXMS2mx6M9KWK/8pVx1MDAxY6dcdTAwMTgmw9NcdTAwMTBcdTAwMWZcdTAwMWX+fDbOUbIzW1x1MDAwNOT7XHUwMDFjmS5cdTAwMWaYb7ygj/B9MXN+KIcsv+FgWEj08lx1MDAwNnBcdTAwMDPcXHUwMDBmgs2wVKW/QONeXcJiPjazx89bK52K/zRcdTAwMGJ0mWyEfIP/5+vYR+RLNlQ0TLaZvsVk29pl7lBcdTAwMTQ96ufeU9DM9Ks9JowrUzlKf5ZcdTAwMWWMjUKyVlwiXjTtpGNM2+iq91x1MDAxNrcrNLBacKpFcomX9iZK6i29V7yaLIUlV1/up9ivLmDYy4/LYPFXQotcdTAwMWZcdTAwMTeIkONcdTAwMWU/WnVcdFGw27DJ95AqoHJ/jHTcR/e8myryXHUwMDFki1x1MDAwMsw07ucmU1x06+SE/1x1MDAxM7uRS8FcdTAwMWPbNHVZKdxkM3GyXlx1MDAxMt7D5FpTwZfyNmIpc5CbMuBcdTAwMWRRvlx1MDAwZmVCIaYsKTKzRlx1MDAwMzrCgXyYZjBoNFx1MDAwMkItxGd6ldo/wnlcdTAwMWNcdTAwMGZcboI/2vFcdTAwMDCos1x1MDAxNVx1MDAxNPhcdTAwMWHWTjOLXHUwMDA2rzHBZFxyXGLIM1FBXHUwMDBiT/juXG5mmzlPdC27M430XHUwMDE15IuDXHUwMDA1jFJIRexcdTAwMGVeLF8uf9p1cXqwVXAsgkq+OF9lt1x1MDAxYS6D09VcdTAwMTNKTlx1MDAxYpHLU5qHhUNdbilSafLZfMDMMoPmQ1x1MDAxMiGOolx1MDAxN87y2llsWrcv/KZcblCidbXTqppgh35JrOSQokGW7LWqdHupgbKFXHUwMDA0QIuB+2a4VnuuM0f4ksz/l62O1bL8XG5NXHUwMDFilTu6vlx1MDAwMT1KtOfkwcv5XHRb49k7XHUwMDE4m12fslZcdTAwMTXOiEQgJKvmflx1MDAxZZPgOFPH1n5NXG49U1x1MDAxNVbscShGXHUwMDAzXHUwMDFk8laOs1x1MDAxOGd/XHUwMDA1xtaTXZR3XCLj+7ynjsRcdNaSpaQxq0eeoVx1MDAwYslK9VOOOVZcdTAwMDI9VkLpXHUwMDAygjHySHK7XHUwMDE2XHS+bvWE+oNcdTAwMTCchI5cIlOLnKiW0iraZ6HxlcB6/Fx1MDAxYVx1MDAxNlaEYHN7R6BzzEGDvGLY8Vx1MDAwZpOtwP/sjYW/+JI8hYA8VchcXM2HndorKVx1MDAxNbYpJVx1MDAwMtuOMoC7uFx1MDAwZYGAnlx1MDAxNPpcctKqxeVt+ZFQRKNLf0zRo1x1MDAxZLEsXHUwMDE5tzWa/3xcdTAwMTfPkrH9RUtG8agrL9Es4W1oTfTMiVH9XHUwMDFmw7n0Pu+ExNbu1nlG9tSA+FuiwYTKXHUwMDFloHWP/LBcdTAwMTH8UKSlQUsynnv87bzwcL6FXXJcdTAwMWUs9FZR0/+zSiuyXHUwMDE0YCtyhyyqyKN07Fi2bbvGrF6UI1x1MDAxMJr8O1x1MDAxNTVMhfzYrCtV4lx1MDAxM2KTQVx1MDAwZt5fw1x0rDZ+ki1e9ufX8lx1MDAxM7PTjoVcdTAwMDdP7TnT/5xcdTAwMGV8j4IyXHUwMDBlvVx1MDAwMlx1MDAxYlh1ky2QXHUwMDE129/IJnimllx1MDAxMydP2YN3mtPbXHUwMDBl2Ptm2tRUXHUwMDAyP7U9baLfdUKU6j9r6Y7ZMqNcdTAwMWVcdTAwMGWL9KBcYt/YNa5R3W4nf6HYblx1MDAxZXFCUW6FMlGsmERjZ1x1MDAxNcFcdTAwMWatx4TYSKJcIuUnu9fDyMFcIlRfM51miDNmK5SPI1x1MDAxN1x1MDAxMbjG2UFOw2Z3oFwi2U21embHbnRcXNF/qjx8+sNFnHKdc+tcdTAwMTarlI1npPuROlx1MDAwZZ+Ff5DbOtiUk1x1MDAxZFx1MDAxOXWl6q0/XG6afLfGTrJcdTAwMWauIYmOKLCbtXKIzsEsP1x1MDAwMJL0TCOJLrqt1YQ7XHUwMDAxXHUwMDE0XHUwMDA1JJbNwMmUj1xyjuX4nl7sjFx1MDAxOFGGbthcbjBHtceIxEtcdFx1MDAxY3qhIF+x2pD0iaM6SFOkXGI8XHUwMDA0xpvGc8eHWZlNlsfZ3f6nVYUp9kSX49Dn+KA8zWfkzoO6pFef9zY8gzUukFBcdTAwMDGt+O/OsmxcdTAwMWb+zC9qp5lgU0N1w+B8XHUwMDFhMUJcdTAwMTVGY1oiLCJjb25maWciOnsicG9zdGVyIjp0cnVlLCJwcmV2aWV3Ijp0cnVlLCJpc0Rvd25sb2FkIjpmYWxzZX0sImRhbm11Ijp7InZpZGVvSWQiOiJEUGxXRW95dU9fanR4RE9zRDFoMFd6U2EtSUMyczhJOEh6YUVsRDdpTTgxQVpNeFBGQ1Jxem5ZQWJsU1ZXSk9TTk90YV9FQ3hFOTJOWnRiV0tNdU9NTTl6YWJUR241RmptZ1VUIn19"
+_ABYSS_HTML = ('<script>window.addEventListener("load", ()=> {const datas = "'
+               + _ABYSS_DATAS + '";if(window.SoTrym)return window.SoTrym('
+                 'JSON.parse(atob(datas)));});</script>')
+_ABYSS_MD5_ID = 30570771
+_ABYSS_TOKEN_2M = "MW0xMFBBc1Z6ZFdOek0zNmQya1lGSEZtNng3S3dCeFVBd3dXOWp3T3BNM3VhWVhH"
+_ABYSS_TOKEN_FULL = "MW0xMFBBc1Z6ZFdOek0zNmQya1lGSEZtNng3S3dCeFVBd3dXOWp3UG9zcmlicExQRTZSLw"
+
+
+def test_aes_ctr_round_trips_and_matches_the_recorded_token():
+    """the hand-rolled AES-256-CTR must agree byte-for-byte with node's
+    aes-256-ctr, which is what the live origin accepted."""
+    key, ctr = addon._md5_key(b"428273:eLY0XBgBP:30570771")
+    assert len(key) == 32 and len(ctr) == 16 and ctr == key[:16]
+    pt = b"the quick brown fox jumps over the lazy dog" * 4     # > 2 blocks
+    assert addon._aes_ctr(addon._aes_ctr(pt, key, ctr), key, ctr) == pt
+    # the segment token: digits-as-numbers key + double base64, no padding
+    assert addon.abyss_token(_ABYSS_MD5_ID, 4, 2081695893, 2097152, 0) == _ABYSS_TOKEN_2M
+    assert addon.abyss_token(_ABYSS_MD5_ID, 4, 2081695893, 2081695893, 0) == _ABYSS_TOKEN_FULL
+    # the key hashes the size's digits AS NUMBERS: '2' -> 0x02, not 0x32
+    k_num, _ = addon._md5_key(bytes([2, 0, 8, 1, 6, 9, 5, 8, 9, 3]))
+    k_txt, _ = addon._md5_key(b"2081695893")
+    assert k_num != k_txt
+
+
+def test_abyss_page_data_decrypts_the_real_blob():
+    blob, media = addon.abyss_page_data(_ABYSS_HTML)
+    assert blob and media
+    assert (blob["slug"], blob["md5_id"], blob["user_id"]) == ("eLY0XBgBP", 30570771, 428273)
+    mp4 = media["mp4"]
+    assert mp4["domains"][0] == "gi7owxbf32.sssrr.org"
+    assert {(s["label"], s["codec"]) for s in mp4["sources"]} == \
+        {("480p", "h264"), ("720p", "h264"), ("1080p", "av1"), ("1080p", "h264")}
+    # the media field's leading "0|" is ciphertext, not a marker to strip
+    assert blob["media"].startswith("0|")
+
+
+def test_abyss_page_data_is_latin1_safe_and_rejects_junk():
+    """the blob carries raw ciphertext bytes inside JSON: decoding it as utf-8
+    raises, which is exactly how the first attempt at this failed."""
+    raw = base64.b64decode(_ABYSS_DATAS)
+    try:
+        raw.decode("utf-8")
+        assert False, "expected the utf-8 decode to fail"
+    except UnicodeDecodeError:
+        pass
+    assert raw.decode("latin-1")                       # the path the code uses
+    for junk in ("", "no datas here", 'const datas = "!!!not base64!!!"',
+                 'const datas = ""'):
+        assert addon.abyss_page_data(junk) == (None, None)
+
+
+def test_abyss_sources_dedupe_by_label_preferring_h264():
+    _blob, media = addon.abyss_page_data(_ABYSS_HTML)
+    srcs = addon.abyss_sources(media)
+    assert [s["label"] for s in srcs] == ["1080p", "720p", "480p"], srcs
+    top = srcs[0]
+    assert top["codec"] == "h264" and top["size"] == 2844976106, "av1 must lose"
+    assert top["base"] == "https://njuaynwkh47.sssrr.org"
+    assert srcs[1]["res_id"] == 4 and srcs[1]["base"] == "https://njuaynwkh47.sssrr.org"
+
+
+def test_abyss_sources_skips_unencoded_and_broken_entries():
+    media = {"mp4": {"domains": ["a.sssrr.org"], "sources": [
+        {"label": "720p", "res_id": 4, "size": 10, "codec": "h264",
+         "status": False, "sub": "s1"},                    # not encoded yet
+        {"label": "480p", "res_id": 3, "size": 9, "codec": "h264",
+         "status": True},                                   # no sub -> unusable
+        {"label": "1080p", "res_id": 5, "size": 11, "codec": "h264",
+         "status": True, "sub": "s2"}]}}
+    srcs = addon.abyss_sources(media)
+    assert [s["label"] for s in srcs] == ["1080p"]
+    assert addon.abyss_sources({"mp4": {"sources": []}}) == []      # no domains
+    assert addon.abyss_sources(None) == []
+
+
+def test_abyss_stream_url_shape_and_seekability():
+    _blob, media = addon.abyss_page_data(_ABYSS_HTML)
+    srcs = {s["label"]: s for s in addon.abyss_sources(media)}
+    url, seek = addon.abyss_stream_url(srcs["720p"], _ABYSS_MD5_ID)
+    assert url == "https://njuaynwkh47.sssrr.org/sora/2081695893/" + _ABYSS_TOKEN_FULL
+    assert seek is False, "2.08 GB is above the 500 MiB Range ceiling"
+    small = dict(srcs["480p"], size=100 * 1024 * 1024)
+    _u, seek2 = addon.abyss_stream_url(small, _ABYSS_MD5_ID)
+    assert seek2 is True
+
+
+def test_human_bytes():
+    assert addon._human_bytes(0) == "" and addon._human_bytes(None) == ""
+    assert addon._human_bytes(512) == "512 B"
+    assert addon._human_bytes(2081695893) == "1.94 GB"
+    assert addon._human_bytes(918991600) == "876.42 MB"
+
+
+def _abyss_fixture_cards(probe=(206, True)):
+    clear_caches()
+    blob, media = addon.abyss_page_data(_ABYSS_HTML)
+
+    class R:
+        text = _ABYSS_HTML
+    with mock.patch.object(addon, "_get", return_value=R()), \
+         mock.patch.object(addon, "_abyss_probe", return_value=probe) as pr:
+        cards = addon.resolve_abyss("https://abyssplayer.com/eLY0XBgBP",
+                                    {"title": "Queens", "year": 2026, "slug": "queens"},
+                                    "", "series", 1, 1, time.time() + 20)
+    return cards, pr, (blob, media)
+
+
+def test_resolve_abyss_probes_with_range_only_when_the_origin_honours_it():
+    cards, pr, _ = _abyss_fixture_cards()
+    assert cards
+    used = {c[0][1] for c in pr.call_args_list}          # positional (url, use_range)
+    assert used == {False}, "every queens source is above the 500 MiB ceiling"
+
+
+def test_resolve_abyss_emits_verified_cards_with_referer_headers():
+    cards, pr, _ = _abyss_fixture_cards()
+    assert len(cards) == 3, [c["name"] for c in cards]
+    c0 = cards[0]
+    assert c0["url"].startswith("https://njuaynwkh47.sssrr.org/sora/2844976106/")
+    assert c0["behaviorHints"]["proxyHeaders"]["request"]["Referer"] == \
+        "https://abyssplayer.com/"
+    assert c0["behaviorHints"]["notWebReady"] is True
+    assert "1080p" in c0["name"] and "Queens" in c0["name"]
+    assert "S01 E01" in c0["description"]
+    assert "2.65 GB" in c0["description"] and "H264" in c0["description"]
+    assert "Abyss" in c0["description"]
+    # every emitted url was probed first: no phantom cards
+    assert pr.call_count == 3
+    for c in cards:
+        assert c["_cdn"] == "abyss" and c["_res"] in ("1080p", "720p", "480p")
+        assert c["_tier"] == "", "a declared label earns no measured tier claim"
+
+
+def test_resolve_abyss_refuses_an_origin_that_will_not_serve_ftyp():
+    """the gate is the whole point: a token we cannot verify is a card we do not
+    emit, even though building it succeeded."""
+    for probe in ((403, False), (200, False), (None, False)):
+        cards, _pr, _ = _abyss_fixture_cards(probe=probe)
+        assert cards == [], probe
+
+
+def test_resolve_abyss_warns_when_seeking_will_not_work():
+    cards, _pr, _ = _abyss_fixture_cards()
+    big = [c for c in cards if "2.65 GB" in c["description"]][0]
+    assert "no seeking" in big["description"]
+    with mock.patch.object(addon, "ABYSS_RANGE_MAX", 10 ** 12):
+        cards2, _p, _m = _abyss_fixture_cards()
+    assert all("no seeking" not in c["description"] for c in cards2)
+
+
+def test_resolve_abyss_notes_survive_alongside_the_caller_note():
+    clear_caches()
+    class R:
+        text = _ABYSS_HTML
+    with mock.patch.object(addon, "_get", return_value=R()), \
+         mock.patch.object(addon, "_abyss_probe", return_value=(206, True)):
+        cards = addon.resolve_abyss("https://abyssplayer.com/eLY0XBgBP",
+                                    {"title": "Queens"}, "full-season file",
+                                    "series", 1, 1, time.time() + 20)
+    assert "full-season file" in cards[0]["description"]
+    assert "no seeking" in cards[0]["description"]
+
+
+def test_resolve_abyss_caches_the_decrypted_media():
+    cards, _pr, _ = _abyss_fixture_cards()
+    assert cards
+    with mock.patch.object(addon, "_get", side_effect=AssertionError("must not refetch")), \
+         mock.patch.object(addon, "_abyss_probe", return_value=(206, True)):
+        again = addon.resolve_abyss("https://abyssplayer.com/eLY0XBgBP",
+                                    {"title": "Queens"}, "", "movie", None, None,
+                                    time.time() + 20)
+    assert len(again) == len(cards)
+
+
+def test_resolve_abyss_kill_switch_and_bad_page():
+    clear_caches()
+    with mock.patch.object(addon, "ABYSS_ON", False), \
+         mock.patch.object(addon, "_get", side_effect=AssertionError("off means off")):
+        assert addon.resolve_abyss("https://abyssplayer.com/x", {}, "", "movie",
+                                   None, None, time.time() + 5) == []
+    assert addon.resolve_abyss("", {}, "", "movie", None, None, time.time() + 5) == []
+
+    class R:
+        text = "<html>no player here</html>"
+    with mock.patch.object(addon, "_get", return_value=R()):
+        assert addon.resolve_abyss("https://abyssplayer.com/x", {}, "", "movie",
+                                   None, None, time.time() + 5) == []
+
+
+def test_resolve_file_falls_back_to_abyss_when_3n1_is_dead():
+    """the real-world shape for 16 of 18 new series: the embed lists three
+    servers, strp2p and rpmvid 404, and only abyss has the file."""
+    clear_caches()
+    page = {"url": "https://banglaplex.biz/watch/queens.html", "title": "Queens",
+            "year": 2026, "slug": "queens", "keys": [("k", True, "Full")],
+            "iframe": "https://plextream.work/embed.php?id=V2aAlO9K"}
+    servers = [("Server 3", "https://abyssplayer.com/eLY0XBgBP"),
+               ("Server 2", "https://bpx.strp2p.site/#skmyti"),
+               ("Server 1", "https://bpx.rpmvid.site/#wnymh1")]
+    with mock.patch.object(addon, "parse_watch_page", return_value=page), \
+         mock.patch.object(addon, "parse_embed_servers", return_value=servers), \
+         mock.patch.object(addon, "resolve_n1", return_value=(None, None, None)), \
+         mock.patch.object(addon, "_get",
+                           return_value=type("R", (), {"text": _ABYSS_HTML})()), \
+         mock.patch.object(addon, "_abyss_probe", return_value=(206, True)):
+        cards = addon._resolve_file(page, None, "Full", "", "series", 1, 1,
+                                    time.time() + 20)
+    assert len(cards) == 3, cards
+    assert all(c["_cdn"] == "abyss" for c in cards)
+
+
+def test_resolve_file_prefers_3n1_and_only_uses_abyss_when_it_fails():
+    clear_caches()
+    page = {"url": "https://banglaplex.biz/watch/x.html", "title": "X", "year": 2026,
+            "slug": "x", "keys": [("k", True, "Full Movie")],
+            "iframe": "https://plextream.work/embed.php?id=1"}
+    servers = [("Server 3", "https://abyssplayer.com/abc"),
+               ("Server 2", "https://bpx.strp2p.site/#vid")]
+    info = {"best": (1920, 800), "n_variants": 2, "size": 200, "variant": "v",
+            "text": TT_MASTER, "segment": "s", "seg_status": 206}
+    with mock.patch.object(addon, "parse_watch_page", return_value=page), \
+         mock.patch.object(addon, "parse_embed_servers", return_value=servers), \
+         mock.patch.object(addon, "resolve_n1",
+                           return_value=({"hlsVideoTiktok": "/hls/m.m3u8"}, "bpx.strp2p.site", "vid")), \
+         mock.patch.object(addon, "collect_subtitles", return_value=[]), \
+         mock.patch.object(addon, "_verify_media", return_value=info), \
+         mock.patch.object(addon, "resolve_abyss",
+                           side_effect=AssertionError("3n1 answered; abyss not needed")):
+        cards = addon._resolve_file(page, None, "Full Movie", "", "movie", None, None,
+                                    time.time() + 20)
+    assert len(cards) == 1 and cards[0]["_cdn"] == "tiktok"
+    # now the same page with every 3n1 candidate failing verification
+    with mock.patch.object(addon, "parse_watch_page", return_value=page), \
+         mock.patch.object(addon, "parse_embed_servers", return_value=servers), \
+         mock.patch.object(addon, "resolve_n1",
+                           return_value=({"hlsVideoTiktok": "/hls/m.m3u8"}, "bpx.strp2p.site", "vid")), \
+         mock.patch.object(addon, "collect_subtitles", return_value=[]), \
+         mock.patch.object(addon, "_verify_media", return_value=None), \
+         mock.patch.object(addon, "resolve_abyss", return_value=[{"_cdn": "abyss"}]) as ra:
+        cards = addon._resolve_file(page, None, "Full Movie", "", "movie", None, None,
+                                    time.time() + 20)
+    assert cards == [{"_cdn": "abyss"}] and ra.called
+
+
+def test_resolve_file_routes_a_bare_abyss_iframe():
+    clear_caches()
+    page = {"url": "https://banglaplex.biz/watch/x.html", "title": "X", "year": 2026,
+            "keys": [("k", True, "Full Movie")],
+            "iframe": "https://abyssplayer.com/UpjbDHK5N"}
+    with mock.patch.object(addon, "parse_watch_page", return_value=page), \
+         mock.patch.object(addon, "parse_embed_servers",
+                           side_effect=AssertionError("must not fetch the wrapper")), \
+         mock.patch.object(addon, "resolve_abyss", return_value=[{"_cdn": "abyss"}]) as ra:
+        cards = addon._resolve_file(page, None, "Full Movie", "", "movie", None, None,
+                                    time.time() + 20)
+    assert cards == [{"_cdn": "abyss"}]
+    assert ra.call_args[0][0] == "https://abyssplayer.com/UpjbDHK5N"
+
+
+def test_abyss_probe_reads_only_the_header_of_a_200():
+    """a 200 on this route means the origin is streaming the ENTIRE object; the
+    probe must stop after the first bytes instead of pulling 2 GB through Render."""
+    read = []
+
+    class Resp:
+        status_code = 200
+
+        def iter_content(self, n):
+            for i in range(1000):
+                read.append(i)
+                yield (b"\x00\x00\x00 ftypisom" if i == 0 else b"x" * 64)
+
+        def close(self):
+            self.closed = True
+    r = Resp()
+    with mock.patch.object(addon, "_fetch", return_value=(r, False)) as f:
+        code, ok = addon._abyss_probe("https://x/sora/1/t")
+    assert (code, ok) == (200, True)
+    assert len(read) == 1, "must stop as soon as ftyp is seen"
+    assert f.call_args[1]["allow_proxy"] is False, "media never rides a free exit"
+    assert f.call_args[1]["referer"] == "https://abyssplayer.com/"
+    assert f.call_args[1]["extra_headers"] == {"Range": "bytes=0-63"}
+
+
+def test_abyss_probe_drops_the_range_header_above_the_ceiling():
+    """measured: with Range the oversized-fragment route answered 200,400,200,400;
+    without it, 200,200,200,200. A range the origin will not honour must not be
+    requested, or half of all good cards are thrown away."""
+    class Resp:
+        status_code = 200
+
+        def iter_content(self, n):
+            yield b"\x00\x00\x00 ftypisom"
+
+        def close(self):
+            pass
+    with mock.patch.object(addon, "_fetch", return_value=(Resp(), False)) as f:
+        assert addon._abyss_probe("https://x/sora/1/t", False) == (200, True)
+    assert f.call_args[1]["extra_headers"] is None
+
+    class Bad(Resp):
+        status_code = 403
+
+        def iter_content(self, n):
+            yield b"<html>denied</html>"
+    with mock.patch.object(addon, "_fetch", return_value=(Bad(), False)):
+        assert addon._abyss_probe("https://x/sora/1/t") == (403, False)
+    with mock.patch.object(addon, "_fetch", return_value=(None, False)):
+        assert addon._abyss_probe("https://x/sora/1/t") == (None, False)
+    with mock.patch.object(addon, "_fetch", side_effect=RuntimeError("boom")):
+        assert addon._abyss_probe("https://x/sora/1/t") == (None, False)
+
+
 def test_prewarm_shelf_is_bounded_and_skips_cached():
     clear_caches()
     addon._PREWARM_BUSY[0] = False
@@ -2995,11 +3428,30 @@ def live_health_over_http():
 LIVE_TESTS = [live_resolve_movie, live_resolve_series_season_pack,
               live_card_actually_plays, live_honest_empty_for_dead_player]
 
+def test_split_id_unprefixes_a_prefixed_imdb_id():
+    """`bpx-tt1234` is legal (the manifest lists both prefixes) but it is an IMDb
+    id, not a site slug — /watch/tt1234.html does not exist, so treating it as a
+    slug answered honestly-empty in ~1s while the bare id resolved fine."""
+    assert addon._split_id("series", "bpx-tt43695931:1:1") == ("tt43695931", 1, 1)
+    assert addon._split_id("movie", "bpx-tt43695931") == ("tt43695931", None, None)
+    # a real slug keeps its prefix: that is how _build_inner finds the watch page
+    assert addon._split_id("series", "bpx-queens:2:3") == ("bpx-queens", 2, 3)
+    assert addon._split_id("movie", "tt1234567") == ("tt1234567", None, None)
+
+
 OFFLINE_TESTS = [v for k, v in sorted(globals().items())
                  if k.startswith("test_") and callable(v)]
 
 
 def main():
+    missed = sorted(k for k, v in globals().items()
+                    if k.startswith("test_") and callable(v) and v not in OFFLINE_TESTS)
+    if missed:
+        # OFFLINE_TESTS is a snapshot of globals() taken above: anything defined
+        # after it would never run, and the suite would still print "all passed"
+        print("!! %d test(s) defined after the runner snapshot, NEVER RAN: %s"
+              % (len(missed), ", ".join(missed)))
+        return 2
     print("BanglaPlex addon %s — %d offline tests" % (addon.VERSION, len(OFFLINE_TESTS)))
     for t in OFFLINE_TESTS:
         run(t)

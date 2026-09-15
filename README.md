@@ -29,6 +29,18 @@ IMDb id
                                 → hex( AES-128-CBC( JSON ) )        [decrypted in pure python]
   └─(6) media verification      master 200 #EXTM3U → variant head-read → first segment 206
   └─(7) card                    url = the CDN master playlist itself (+ VTT subtitles)
+
+  …and when the watch page embeds abyssplayer.com instead (or the 3n1 id is dead):
+  └─(4b) embed page             abyssplayer.com/{id}  →  const datas = "<base64 JSON>"
+                                {slug, md5_id, user_id, media:"0|"<AES-256-CTR>, config, danmu}
+  └─(5b) source list            decrypt `media` with key = utf8(md5hex(user_id:slug:md5_id))
+                                (pure-python AES-256-CTR, counter = key[:16]) → per-quality
+                                {label, codec, size, res_id, sub, domains[]}
+  └─(6b) sora token             per source: k = md5hex(digits-of-size as bytes) → utf8,
+                                iv = k[:16]; path = /mp4/{md5_id}/{res_id}/{size}/{FRAG}/0;
+                                token = b64(b64(AES-256-CTR(path)))
+  └─(7b) card                   url = https://{sub}.{domain}/sora/{size}/{token}
+                                (+ `Referer: https://abyssplayer.com/`) → progressive MP4
 ```
 
 **Stream paths, in the site's own priority order:**
@@ -38,7 +50,7 @@ IMDb id
 | 1 | **TikTok CDN** (`hlsVideoTiktok`) | nothing — no headers | master+variant are proxied by the 3n1 frontend, segments are absolute `*.tiktokcdn.com` URLs signed until 2027 |
 | 2 | **Cloudflare** (`cfNative`) | `proxyHeaders.Referer` + `notWebReady` | segments are referer-gated on the CF edge |
 | — | `source` (raw-IP origin) | — | **disabled**: its token binds to the fetcher's IP, so it verifies from Render and 403s on the user's player. A phantom card is worse than no card. (`BPX_INHOUSE=1` to debug) |
-| — | `abyssplayer.com` | — | SoTrym player, AES-CTR key not extracted → honest skip |
+| 3 | **Abyss** (`abyssplayer.com`) | `proxyHeaders.Referer` + `notWebReady` | SoTrym player. The `datas` blob decrypts to a per-quality source list, and the origin's own `/sora/{size}/{token}` route serves the **whole file as a progressive MP4** once it is handed a token it minted the key for. `ftyp` verified at byte 0 before a card is emitted. Files over 500 MiB play straight through — no seeking (see Known limits) |
 | — | `bestx.stream` / `chillx.top` | — | DNS resolves, TLS handshake fails (dead) → honest skip. Only affects 2023-24 catalog entries |
 
 ### Series model
@@ -181,12 +193,17 @@ The page's JS encoder produces byte-identical segments to the server's decoder
 ### Zero bandwidth
 
 Render carries **no media bytes**. This addon only ever emits small JSON: card
-URLs point straight at `bpx.strp2p.site` / `tiktokcdn.com` / the CF edge, and
-subtitles are direct `.vtt` URLs. There are no `/hls`, `/seg`, `/proxy` or media
+URLs point straight at `bpx.strp2p.site` / `tiktokcdn.com` / the CF edge / the
+abyss `*.sssrr.org` origin, and subtitles are direct `.vtt` URLs. Abyss cards are
+the strongest form of this: the token is computed locally and the player pulls the
+MP4 from the origin itself — the addon never touches the video, not even its head
+beyond a 64-byte magic check. There are no `/hls`, `/seg`, `/proxy` or media
 MIME routes in the source at all (`test_zero_bandwidth_no_media_routes` guards
 this). Playlist probing uses `stream=True` + an 8 KB head-read + `close()`,
 because the 3n1 frontends **ignore `Range` on variant playlists** and would
-otherwise stream ~1.4 MB per probe into the dyno.
+otherwise stream ~1.4 MB per probe into the dyno. Abyss probes read 64 bytes, and
+drop the `Range` header entirely above the origin's 500 MiB ceiling (one of the two
+backends behind the load balancer answers a ranged request with a 400).
 
 ---
 
@@ -199,7 +216,12 @@ otherwise stream ~1.4 MB per probe into the dyno.
   next tap retries immediately. Only a genuine "the site answered: not here"
   gets the short 300 s negative cache.
 - **No invented tokens.** Card lines omit whatever we don't know (no fake
-  `1080p`, no `0 SUB`, no runtime we didn't parse).
+  `1080p`, no `0 SUB`, no runtime we didn't parse). An abyss card says
+  `no seeking (plays straight through)` when the file is above the origin's range
+  ceiling, instead of letting the player discover it mid-film.
+- **No borrowed sizes.** The `▤` token only ever shows a real media byte count.
+  A master playlist's own length (323 B) once printed as the size of a 1080p
+  feature; the playlist probe now reports `pl_bytes` and the card ignores it.
 - **Resolution comes from width, not height.** These are scope-cropped files:
   `1920x800` *is* the 1080p encode and `1280x532` *is* the 720p one.
   Height-only bucketing mislabelled every single card during testing.
@@ -266,6 +288,7 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 | `BPX_MAX_SUBS` | `6` | subtitle tracks per card (en/hi/bn first) |
 | `BPX_CARDS` | `1` | `0` = kill switch, answers empty |
 | `BPX_INHOUSE` | `0` | `1` = also emit the IP-bound raw-IP path (debug only) |
+| `BPX_ABYSS` | `1` | `0` = kill switch for the abyssplayer path |
 | `BPX_PROXY` | `auto` | `0` = never use the free proxy pool |
 | `BPX_PROXY_SOURCE` | proxyscrape | free HTTP proxy list URL(s), comma-separated |
 | `BPX_PROXY_LIST` | *(none)* | hand-picked exits (`http://user:pass@host:port,…`) — always ride first |
@@ -281,16 +304,19 @@ that, and a liveness watchdog restarts the process if `/health` fails 3×.
 ## Tests
 
 ```bash
-python3 test_banglaplex.py           # 198 offline tests, every network call mocked
+python3 test_banglaplex.py           # 246 offline tests, every network call mocked
 BPX_LIVE=1 python3 test_banglaplex.py # + 4 live integration tests (real site/CDN)
 ```
 
 The offline suite covers the pure-python AES (FIPS-197 C.1 + a node
-`createCipheriv` known-answer), page/embed parsing, the key picker, search and
+`createCipheriv` known-answer for both the 3n1 AES-128-CBC payload and the abyss
+AES-256-CTR media/sora tokens), page/embed parsing, the key picker, search and
 match scoring, the 429/404/transient branches of the player API, the
 no-phantom media gate, subtitle ranking, card formatting, both cache paths
 (positive, negative, SWR, wall timeout), every HTTP route and the
-zero-bandwidth contract.
+zero-bandwidth contract. The abyss block pins a real `datas` fixture from a live
+title, the sora token vectors, source dedupe/ordering, the range ceiling, the
+kill switch and the 3n1-dead → abyss fallback.
 
 The live block really resolves `tt0213890` (movie) and `tt31924802:1:1`
 (series season pack), then plays each emitted card the way a player would:
@@ -299,16 +325,36 @@ rate-limit budget, so don't loop it.
 
 > **The runner is the last thing in the file.** A test defined after
 > `if __name__ == "__main__"` silently never runs — that bug shipped once
-> already in this fleet.
+> already in this fleet. `OFFLINE_TESTS` is a snapshot of `globals()`, so a test
+> defined after *that* line was silently skipped too (it reported 245/245 while
+> 246 existed); `main()` now diffs the two and exits 2 instead of printing green.
+>
+> **Pool tests must not depend on wall-clock races.** `as_completed` yields
+> already-finished futures in *set* order, so "the slow exit loses" is not a
+> deterministic premise — hold the loser on an `threading.Event` and release it
+> after the winner is declared. Background threads (SWR refresh, negative retry,
+> shelf prewarm, pool trainer) are plain `threading.Thread`s that outlive the test
+> which spawned them and land in whatever mock is installed next; the pool
+> diagnostics pin `_pool_order` and answer per-exit rather than per-call-order
+> because of it.
 
 ---
 
 ## Known limits
 
-- **~1 in 6 current titles is abyss-only** (`abyssplayer.com`, SoTrym player).
-  Its `datas` blob is base64 JSON but the `media` field is AES-CTR under a key
-  buried in an obfuscated 216 KB `core.bundle.js`; not extracted → those titles
-  answer empty instead of guessing.
+- **Abyss files over 500 MiB cannot seek.** `Range` works up to
+  `FRAG=524288000`; above it the origin answers 200 with the whole body (and one of
+  its two backends returns 400 to a ranged request outright). The card is still
+  emitted — `moov` sits at the front, so playback starts instantly and runs
+  linearly — and says `no seeking (plays straight through)`. Most 1080p features
+  are above the ceiling; 480p/720p renditions of the same title usually are not,
+  which is why up to three qualities are offered.
+- **Abyss titles carry no subtitle tracks.** The `datas` blob holds `media`,
+  `config` and `danmu` only — no caption list exists to scrape, so those cards
+  honestly show no `⟡ N SUB`.
+- **~89% of *new* BanglaPlex series are abyss-only** (the 3n1 id is 404 and
+  `/api/v1/folder` returns `[]`). These now resolve through path 3; before v1.4.0
+  they answered empty.
 - **2023-24 catalog entries** often sit on `bestx.stream` / `chillx.top`, whose
   TLS handshakes now fail. Dead upstream, nothing to scrape.
 - **Older uploads can have deleted 3n1 ids** (`404 Video not found or deleted`)

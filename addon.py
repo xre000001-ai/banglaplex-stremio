@@ -34,6 +34,7 @@ Design laws inherited from the sister addons (moviebox / animedekho / netmirror)
 
 import base64
 import gzip
+import hashlib
 import html as _html
 import io
 import json
@@ -50,7 +51,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.3.2"
+VERSION    = "1.4.0"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -88,6 +89,7 @@ _SEARCH_TTL   = 3600
 _PAGE_TTL     = 6 * 3600
 _META_TTL     = 12 * 3600
 _EMBED_TTL    = 6 * 3600
+_ABYSS_TTL    = 6 * 3600          # decrypted media map: tokens carry no expiry
 _N1_TTL       = 30 * 60        # video payload (tiktok urls live ~1y, cf k/kx ~24h)
 _STREAM_TTL   = 40 * 60
 _STREAM_STALE = 100 * 60       # SWR ceiling (cf token ~24h, tiktok ~1y)
@@ -191,16 +193,22 @@ C_LIST    = TTLCache(8 * 1024 * 1024, "listings")
 C_IMDB    = TTLCache(2 * 1024 * 1024, "imdbmap")
 C_METARES = TTLCache(6 * 1024 * 1024, "metares")
 C_SLUG    = TTLCache(1 * 1024 * 1024, "slugmap")
+C_ABYSS   = TTLCache(4 * 1024 * 1024, "abyss")
 C_STALE   = {}                                    # key -> (expiry, cards)
 _NEG_RETRY_AT = {}
 _SWR_RUNNING = set()
 _SWR_LOCK = threading.Lock()
 
 _IO_EX   = ThreadPoolExecutor(max_workers=12, thread_name_prefix="io")
-_V_EX    = ThreadPoolExecutor(max_workers=6, thread_name_prefix="verify")
+# 6 verify workers starved as soon as a resolve had both an HLS candidate set and
+# three abyss qualities to probe: three concurrent taps pushed the slowest past
+# the answer wall. These are all blocking sockets, not CPU, so threads are cheap.
+_V_EX    = ThreadPoolExecutor(max_workers=14, thread_name_prefix="verify")
 _P_EX    = ThreadPoolExecutor(max_workers=10, thread_name_prefix="proxy")
 _PP_EX   = ThreadPoolExecutor(max_workers=16, thread_name_prefix="poolprobe")
-_BUILD_EX = ThreadPoolExecutor(max_workers=2, thread_name_prefix="build")
+# 2 builds meant a third concurrent tap could only wait; a build that outlives the
+# wall still pays off now (see _adopt_late_result), but waiting is not resolving.
+_BUILD_EX = ThreadPoolExecutor(max_workers=4, thread_name_prefix="build")
 
 _S = requests.Session()
 _S.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
@@ -818,14 +826,20 @@ def _pool_get(url, hd, timeout, stream=False):
     futs = {_P_EX.submit(one, u): u for u in exits}
     win = []
 
-    def reap(f):
-        if win and f is not win[0]:
+    def _close_if_done(f):
+        try:
+            r = f.result(timeout=0)
+        except Exception:
+            return
+        if r is not None:
             try:
-                r = f.result(timeout=0)
-                if r is not None:
-                    r.close()
+                r.close()
             except Exception:
                 pass
+
+    def reap(f):
+        if win and f is not win[0]:
+            _close_if_done(f)
     for f in futs:
         f.add_done_callback(reap)
     try:
@@ -836,11 +850,21 @@ def _pool_get(url, hd, timeout, stream=False):
                 r = None
             if r is not None:
                 win.append(f)
+                # A racer that finished BEFORE the winner was declared never got
+                # reaped — reap only closes once `win` is set — so its response
+                # leaked a socket for the life of the process. Close the losers
+                # that are already done; the ones still in flight are reaped by
+                # the callback now that `win` exists.
+                for g in futs:
+                    if g is not f:
+                        _close_if_done(g)
                 return r
     except Exception:
         pass                                       # every racer timed out
     for f in futs:
-        if not f.done():
+        if f.done():
+            _close_if_done(f)                      # nobody won: hold nothing open
+        else:
             f.cancel()
     return None
 
@@ -1474,6 +1498,320 @@ def resolve_n1(servers, deadline=None):
     return None, None, None
 
 
+# ══════════════════════════════════════ 9b. ABYSS PLAYER (SoTrym) — SERVEABLE
+# Most of BanglaPlex's newest titles are abyss-only: their 3n1 servers answer 404
+# "Video not found or deleted", the folder API decrypts to [], and only
+# abyssplayer.com holds the media. That player hides the file behind a browser
+# service worker, so it looked unserveable. It is not — the origin hands the
+# PLAINTEXT file to anyone presenting a token, and every input to that token is
+# already in the page:
+#
+#   const datas = "<base64>"            (atob -> JSON, decoded as latin-1)
+#     {slug, md5_id, user_id, media}
+#   media   = AES-256-CTR(json, key=utf8(md5hex("user_id:slug:md5_id")),
+#                               counter=key[:16])
+#             -> {"mp4":{"sources":[{label,res_id,size,codec,status,sub}],
+#                        "domains":["<sub>.sssrr.org", ...], "fristDatas":[...]}}
+#   token   = b64(b64(AES-256-CTR("/mp4/{md5_id}/{res_id}/{size}/{frag}/{idx}",
+#                       key=utf8(md5hex(digits_of(size))), counter=key[:16])))
+#   GET https://{sub}.{domain}/sora/{size}/{token}  Referer: abyssplayer.com/
+#
+# Two details that are not obvious and are both load-bearing:
+#   * the token key hashes the size's digits AS NUMBERS ("2" -> 0x02, not 0x32);
+#   * `media` starts with "0|" and those two bytes ARE ciphertext, not a marker —
+#     decrypting the whole field yields JSON beginning `{"mp4"`.
+# Measured on a real title: chunk 0 came back `ftyp isom` + `moov` + `mdat`, and
+# the boxes summed to exactly the declared size (2 081 695 893 B, 162 min).
+#
+# Nothing is relayed: the player fetches the media straight from the origin, so
+# zero-media-bytes-through-Render still holds. AES-256-CTR below is hand-rolled
+# (encrypt only — CTR is symmetric) to keep the one-dependency profile; it is
+# pinned by tests against node's aes-256-ctr for both the media blob and tokens.
+#
+# Range has a ceiling: fragments up to 500 MiB answer 206, above that the origin
+# ignores Range and streams the object from byte 0. Playback works either way
+# (these files are faststart — moov before mdat); only seeking needs the ceiling,
+# and the card says so rather than pretending.
+
+ABYSS_REFERER  = "https://abyssplayer.com/"
+ABYSS_FRAG     = 2097152                    # the player's own fragment size
+ABYSS_RANGE_MAX = 524288000                 # 500 MiB: Range stops being honoured
+ABYSS_MAX_CARDS = 3
+ABYSS_ON       = os.environ.get("BPX_ABYSS", "1") != "0"
+
+_SBOX = [
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
+]
+_RCON = [0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36,0x6c,0xd8,0xab,0x4d]
+
+
+def _xtime(b):
+    b <<= 1
+    return (b ^ 0x1b) & 0xff if b & 0x100 else b
+
+
+def _aes_expand(key):
+    """32-byte key -> 15 AES-256 round keys."""
+    nk, nr = len(key) // 4, 14
+    w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
+    for i in range(nk, 4 * (nr + 1)):
+        t = list(w[i - 1])
+        if i % nk == 0:
+            t = [_SBOX[x] for x in (t[1:] + t[:1])]
+            t[0] ^= _RCON[i // nk - 1]
+        elif nk > 6 and i % nk == 4:
+            t = [_SBOX[x] for x in t]
+        w.append([w[i - nk][j] ^ t[j] for j in range(4)])
+    return [bytes(b for col in w[4 * r:4 * r + 4] for b in col) for r in range(nr + 1)]
+
+
+def _aes_block(block, rks):
+    s = [list(block[i::4]) for i in range(4)]          # state[r][c] = in[r + 4c]
+
+    def ark(rk):
+        for c in range(4):
+            for r in range(4):
+                s[r][c] ^= rk[4 * c + r]
+
+    ark(rks[0])
+    for rnd in range(1, 14):
+        for r in range(4):
+            for c in range(4):
+                s[r][c] = _SBOX[s[r][c]]
+        for r in range(1, 4):
+            s[r] = s[r][r:] + s[r][:r]
+        for c in range(4):
+            col = [s[r][c] for r in range(4)]
+            t = col[0] ^ col[1] ^ col[2] ^ col[3]
+            for r in range(4):
+                s[r][c] = col[r] ^ t ^ _xtime(col[r] ^ col[(r + 1) % 4])
+        ark(rks[rnd])
+    for r in range(4):
+        for c in range(4):
+            s[r][c] = _SBOX[s[r][c]]
+    for r in range(1, 4):
+        s[r] = s[r][r:] + s[r][:r]
+    ark(rks[14])
+    return bytes(s[r][c] for c in range(4) for r in range(4))
+
+
+def _aes_ctr(data, key, counter):
+    """CTR is symmetric, so encrypt-only is enough. The whole 16-byte block is
+    the counter and increments big-endian — that is what WebCrypto does for
+    {name:'AES-CTR', length:128} and what node's aes-256-ctr does."""
+    rks = _aes_expand(key)
+    ctr = int.from_bytes(counter, "big") & ((1 << 128) - 1)
+    out = bytearray()
+    for off in range(0, len(data), 16):
+        ks = _aes_block(ctr.to_bytes(16, "big"), rks)
+        out += bytes(x ^ y for x, y in zip(data[off:off + 16], ks))
+        ctr = (ctr + 1) & ((1 << 128) - 1)
+    return bytes(out)
+
+
+def _md5_key(secret_bytes):
+    """expandKey(): utf8(md5hex(secret)) is the 32-byte key, its first half the
+    counter."""
+    k = hashlib.md5(secret_bytes).hexdigest().encode("ascii")
+    return k, k[:16]
+
+
+_ABYSS_DATAS_RE = re.compile(r'const\s+datas\s*=\s*"([^"]+)"')
+_ABYSS_URL_RE = re.compile(r'https?://[^"\'<>\s]*' + re.escape(ABYSS_HOST) + r'/([A-Za-z0-9]+)')
+
+
+def abyss_page_data(html):
+    """player page HTML -> (blob, media) with media decrypted, or (None, None)."""
+    m = _ABYSS_DATAS_RE.search(html or "")
+    if not m:
+        return None, None
+    try:
+        blob = json.loads(base64.b64decode(m.group(1)).decode("latin-1"))
+    except Exception:
+        return None, None
+    raw = blob.get("media")
+    if not isinstance(raw, str) or "|" not in raw:
+        return None, None
+    key, ctr = _md5_key(("%s:%s:%s" % (blob.get("user_id"), blob.get("slug"),
+                                       blob.get("md5_id"))).encode("utf-8"))
+    try:
+        media = json.loads(_aes_ctr(raw.encode("latin-1"), key, ctr).decode("utf-8"))
+    except Exception:
+        _STATS["abyss_decrypt_fail"] = _STATS.get("abyss_decrypt_fail", 0) + 1
+        return None, None
+    return blob, media
+
+
+def _res_px(label):
+    m = re.search(r"(\d{3,4})\s*p", (label or "").lower())
+    if m:
+        return int(m.group(1))
+    return {"4k": 2160, "8k": 4320, "origin": 10 ** 6}.get((label or "").lower(), 0)
+
+
+_ABYSS_CODEC_RANK = {"h264": 0, "avc": 0, "hevc": 1, "h265": 1, "av1": 2}
+
+
+def abyss_sources(media):
+    """-> one entry per quality label, best first. Within a label h264 wins over
+    av1: the same picture offered twice is not two choices, and av1 is the one
+    that fails to play on older devices."""
+    mp4 = (media or {}).get("mp4") or {}
+    domains = [d for d in (mp4.get("domains") or []) if d and "." in d]
+    if not domains:
+        return []
+    root = domains[0].split(".", 1)[1]
+    best = {}
+    for s in mp4.get("sources") or []:
+        if not isinstance(s, dict) or not s.get("status"):
+            continue                                  # status:false = not encoded
+        lab, sub, size, rid = (s.get("label"), s.get("sub"),
+                               s.get("size"), s.get("res_id"))
+        if not (lab and sub and size and rid):
+            continue
+        codec = (s.get("codec") or "").lower()
+        cand = {"label": lab, "codec": codec, "size": int(size), "res_id": int(rid),
+                "sub": sub, "base": "https://%s.%s" % (sub, root)}
+        cur = best.get(lab)
+        if cur is None or ((_ABYSS_CODEC_RANK.get(codec, 9), -cand["size"]) <
+                           (_ABYSS_CODEC_RANK.get(cur["codec"], 9), -cur["size"])):
+            best[lab] = cand
+    return [best[k] for k in sorted(best, key=lambda l: -_res_px(l))]
+
+
+def abyss_token(md5_id, res_id, size, frag, index):
+    """the origin does the decrypting; this is only the authorisation token."""
+    path = "/mp4/%s/%s/%s/%s/%s" % (md5_id, res_id, size, frag, index)
+    # the size is hashed as digits-as-numbers, not as its text
+    key, ctr = _md5_key(bytes(int(c) if c.isdigit() else ord(c) for c in str(size)))
+    ct = _aes_ctr(path.encode("utf-8"), key, ctr)
+    once = base64.b64encode(ct).decode("ascii").rstrip("=")
+    return base64.b64encode(once.encode("ascii")).decode("ascii").rstrip("=")
+
+
+def abyss_stream_url(src, md5_id):
+    """(url, seekable). One fragment the size of the whole file => one URL for
+    the complete mp4; under the 500 MiB ceiling the origin also honours Range."""
+    size = src["size"]
+    tok = abyss_token(md5_id, src["res_id"], size, size, 0)
+    return "%s/sora/%s/%s" % (src["base"], size, tok), size <= ABYSS_RANGE_MAX
+
+
+def _abyss_probe(url, use_range=True):
+    """NO-PHANTOM gate: the origin must answer and the first bytes must be an
+    ISO-BMFF header. Never proxied — media must not ride a free exit — and only
+    the first bytes are read, because a 200 here means the origin is about to
+    stream the entire object at us.
+
+    `use_range` is not a preference, it is a correctness switch. Above the 500 MiB
+    ceiling the origin's backends disagree about Range: measured on a real title,
+    four probes with `Range: bytes=0-63` came back 200, 400, 200, 400 while four
+    probes without it came back 200, 200, 200, 200. Asking for a range the origin
+    will not honour would throw away half of all perfectly good cards."""
+    try:
+        r, _via = _fetch(url, timeout=15, referer=ABYSS_REFERER, stream=True,
+                         allow_proxy=False,
+                         extra_headers={"Range": "bytes=0-63"} if use_range else None)
+        if r is None:
+            return None, False
+        try:
+            code = r.status_code
+            head = b""
+            if code in (200, 206):
+                for chunk in r.iter_content(64):
+                    head += chunk or b""
+                    if len(head) >= 12:
+                        break
+            return code, bool(code in (200, 206) and head[4:8] == b"ftyp")
+        finally:
+            r.close()
+    except Exception:
+        return None, False
+
+
+def _human_bytes(n):
+    try:
+        n = float(n or 0)
+    except Exception:
+        return ""
+    if n <= 0:
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%.0f %s" % (n, unit)) if unit == "B" else ("%.2f %s" % (n, unit))
+        n /= 1024.0
+    return ""
+
+
+def resolve_abyss(abyss_url, page=None, note="", ctype="movie", se=None, ep=None,
+                  deadline=None):
+    """abyssplayer.com/<id> -> verified progressive-mp4 cards (best quality
+    first). Zero bytes relayed: the card points the player at the origin."""
+    if not ABYSS_ON or not abyss_url:
+        return []
+    hit, data = C_ABYSS.get(abyss_url)
+    if hit and data:
+        blob, media = data
+    else:
+        r = _get(abyss_url, timeout=15, referer=SITE + "/")
+        blob, media = abyss_page_data((r.text if r is not None else "") or "")
+        if not media:
+            return []
+        C_ABYSS.put(abyss_url, (blob, media), _ABYSS_TTL)
+    srcs = abyss_sources(media)
+    if not srcs:
+        return []
+    pg = dict(page or {})
+    pg.setdefault("_ctype", ctype)
+    pg["_se"], pg["_ep"] = se, ep
+    # probe every quality in parallel: sequentially this cost ~3 s per source and
+    # the whole point of the fallback is that 3n1 already burned the budget
+    picks = []
+    for src in srcs[:ABYSS_MAX_CARDS]:
+        url, seekable = abyss_stream_url(src, blob.get("md5_id"))
+        picks.append((src, url, seekable,
+                      _V_EX.submit(_abyss_probe, url, seekable)))
+    cards = []
+    budget = max(0.5, (deadline or (time.time() + 20)) - time.time())
+    for src, url, seekable, f in picks:
+        if len(cards) >= MAX_CARDS:
+            f.cancel()
+            continue
+        try:
+            code, ok = f.result(timeout=budget)
+        except Exception:
+            code, ok = None, False
+        if not ok:
+            _STATS["abyss_fail"] = _STATS.get("abyss_fail", 0) + 1
+            continue
+        _STATS["abyss_ok"] = _STATS.get("abyss_ok", 0) + 1
+        info = {"best": (0, 0), "label": src["label"], "size": src["size"],
+                "media_size": src["size"], "codec": src["codec"],
+                "seekable": seekable, "probe": code}
+        n = note or ""
+        if not seekable:
+            # honest about the one thing this path cannot do
+            n = (n + " ◇ " if n else "") + "no seeking (plays straight through)"
+        cards.append(format_card("abyss", url, ABYSS_REFERER, "Abyss", info, pg,
+                                 {}, note=n))
+    return cards
+
+
 # ══════════════════════════════════════════════════════ 10. MEDIA CANDIDATES
 def _abs(base, rel):
     if not rel:
@@ -1520,7 +1858,7 @@ def _master_info(url, referer=None):
              if l.strip() and not l.startswith("#")]
     variant = _abs(url, lines[0]) if lines else ""
     return {"text": txt, "best": best, "variant": variant,
-            "n_variants": len(lines), "size": len(txt)}
+            "n_variants": len(lines), "pl_bytes": len(txt)}
 
 
 def _verify_media(kind, master_url, referer):
@@ -1658,6 +1996,10 @@ def format_card(kind, master_url, referer, server_label, info, page,
     tier, res = _res_label(w, h)
     ft = file_tags((payload or {}).get("title") or "")
     site_q = (page or {}).get("quality") or ""
+    if not res and info.get("label"):
+        # a progressive mp4 has no playlist to measure: the origin's own label is
+        # the best evidence available, and it earns no tier claim
+        res, tier = info["label"], ""
     if not res and site_q:
         res, tier = site_q, ""       # no measured resolution -> no tier claim
     name_toks = []
@@ -1680,11 +2022,17 @@ def format_card(kind, master_url, referer, server_label, info, page,
         l2.append("MOVIE")
     if note:
         l2.append("⚠ %s" % note)
+    if info.get("media_size"):
+        # only a genuine media byte count may be shown here: a master playlist's
+        # own length used to land in this slot and the card claimed "▤ 323 B"
+        # for a 1080p feature
+        l2.append("▤ " + _human_bytes(info["media_size"]))
     dur = _fmt_dur((page or {}).get("duration"))
     if dur:
         l2.append("◷ " + dur)
-    if ft["codec"]:
-        l2.append("▧ " + ft["codec"])
+    codec = ft["codec"] or (info.get("codec") or "").upper()
+    if codec:
+        l2.append("▧ " + codec)
     lines.append("◫ " + " ◇ ".join(l2))
     l3 = [x for x in (ft["source"], ("♫ " + ft["audio"]) if ft["audio"] else "") if x]
     if l3:
@@ -1797,22 +2145,34 @@ def _resolve_file(page, key, label, note, ctype, se, ep, deadline):
     host = urlparse(iframe).netloc
     if not iframe:
         return []
-    if ABYSS_HOST in host:
-        return []                                      # SoTrym — unsupported (honest)
+    if not HLS_ON:
+        return []                                      # global kill switch
     if any(x in host for x in LEGACY_PLAYERS):
         return []                                      # dead player hosts (old catalog)
+    if ABYSS_HOST in host:
+        # the iframe IS the abyss player (some entries skip the 3n1 wrapper)
+        return resolve_abyss(iframe, pg, note, ctype, se, ep, deadline)
     servers = parse_embed_servers(iframe)
     if not servers:
         return []
+    abyss_url = next((u for _l, u in servers if ABYSS_HOST in (u or "")), "")
+
+    def _via_abyss():
+        """3n1 has nothing for this title — which is the normal case for the
+        newest series, whose files were deleted from strp2p/rpmvid and live only
+        on abyss. Fall back instead of answering empty."""
+        return resolve_abyss(abyss_url, pg, note, ctype, se, ep, deadline) \
+            if abyss_url else []
+
     payload, n1host, vid = resolve_n1(servers, deadline=deadline)
     if not payload:
-        return []
+        return _via_abyss()
     subs = collect_subtitles(payload, n1host)
     pg = dict(pg)
     pg["_ctype"], pg["_se"], pg["_ep"] = ctype, se, ep
     cands = media_candidates(payload, n1host)
-    if not cands or not HLS_ON:
-        return []
+    if not cands:
+        return _via_abyss()
     # verify in parallel, keep the site's own priority order (TikTok > CF > in-house)
     futs = [(kind, murl, ref, srv,
              _V_EX.submit(_verify_media, kind, murl, ref)) for kind, murl, ref, srv in cands]
@@ -1829,6 +2189,10 @@ def _resolve_file(page, key, label, note, ctype, se, ep, deadline):
             continue
         cards.append(format_card(kind, murl, ref, srv, info, pg, payload,
                                  note=note, subs=subs))
+    if not cards:
+        # every 3n1 candidate failed verification (dead master, 404 segments):
+        # the same title is often alive on abyss
+        cards = _via_abyss()
     return cards
 
 
@@ -3039,10 +3403,22 @@ def _public_base(handler):
     return "http://" + host
 
 
+_BPX_TT_RE = re.compile(r"^bpx-(tt\d{5,})$")
+
+
 def _split_id(ctype, raw):
-    """tt1234:2:5 -> (imdb, se, ep)"""
+    """tt1234:2:5 -> (imdb, se, ep)
+
+    The manifest advertises both `tt` and `bpx-` prefixes, so a client is allowed
+    to send `bpx-tt1234`. That must NOT be read as a site slug: /watch/tt1234.html
+    does not exist, and the request used to come back honestly-empty in ~1s while
+    the very same id without the prefix resolved fine. Normalising here fixes
+    /stream, /meta and /subtitles at once."""
     parts = raw.split(":")
     imdb = parts[0]
+    m = _BPX_TT_RE.match(imdb)
+    if m:
+        imdb = m.group(1)
     se = ep = None
     if ctype == "series" and len(parts) >= 3:
         try:
