@@ -1902,6 +1902,107 @@ def test_list_page_serves_stale_and_revalidates_in_background():
     assert not addon._LIST_REFRESH, "the refresh flag must be released"
 
 
+def test_looks_blocked_spots_a_200_interstitial():
+    """some free exits are themselves Cloudflare-flagged and answer 200 with a
+    challenge page: measured on prod as a shelf that cached 0 items."""
+    chal = ('<html><head><title>Just a moment...</title></head><body>'
+            '<div id="cf-browser-verification"></div>Checking your browser before'
+            ' accessing. Ray ID: abc123</body></html>')
+    assert addon._looks_blocked(chal, 200) is True
+    assert addon._looks_blocked("", 403) is True and addon._looks_blocked("x", 503) is True
+    assert addon._looks_blocked('[{"title":"Mirzapur"}]', 200) is False
+    assert addon._looks_blocked("a5dc8b828864" * 400, 200) is False, "hex API blob"
+    assert addon._looks_blocked("<html>powered by cloudflare</html>", 200) is False, \
+        "one marker in a small body is not proof"
+    assert addon._looks_blocked("", 200) is False
+    big = "<html>" + ("real content " * 3000) + "just a moment cf-chl- x</html>"
+    assert addon._looks_blocked(big, 200) is False, "a big real page is never a challenge"
+
+
+def test_fetch_treats_a_direct_interstitial_as_blocked():
+    _pool_reset()
+    chal = _resp(200, '<div id="cf-browser-verification">Just a moment Ray ID</div>')
+    good = _resp(200, "<html>real page</html>")
+    seq = [chal, good]
+    used = []
+
+    def fake(u, **k):
+        used.append(k.get("proxies"))
+        return seq.pop(0) if seq else good
+    with mock.patch.object(addon._S, "get", side_effect=fake):
+        r, via = addon._fetch("https://banglaplex.biz/year/2026.html")
+    assert via is True and r.text == "<html>real page</html>"
+    assert used[0] is None, "direct was tried first"
+    assert addon._DIRECT_BAD["banglaplex.biz"] > time.time()
+
+
+def test_pool_get_rejects_an_exit_that_serves_an_interstitial():
+    _pool_reset()
+    chal = _resp(200, '<div id="cf-browser-verification">Just a moment Ray ID</div>')
+    good = _resp(200, "<html>real</html>")
+
+    def fake(u, **k):
+        p = (k.get("proxies") or {}).get("http")
+        if p == "http://1.1.1.1:8080":
+            return chal                      # flagged exit answering 200
+        if p == "http://2.2.2.2:8080":
+            time.sleep(0.2)
+            return good
+        raise RuntimeError("dead")
+    with mock.patch.object(addon._S, "get", side_effect=fake):
+        r = addon._pool_get("https://x/y", {"User-Agent": "t"}, 5)
+    assert r is good
+    for _ in range(60):
+        if addon._POOL_BAD.get("http://1.1.1.1:8080"):
+            break
+        time.sleep(0.05)
+    assert addon._POOL_BAD.get("http://1.1.1.1:8080", 0) - time.time() > 600, \
+        "a flagged exit must be benched as platform-blocked, not merely dead"
+
+
+def test_list_page_small_empty_body_is_transient_not_an_empty_shelf():
+    """a genuinely empty shelf (/type/web-series.html) is still ~40 KB; a tiny
+    0-card body is a broken fetch and must not blank the shelf for 5 minutes."""
+    clear_caches()
+    addon._LIST_STALE.clear()
+
+    class R:
+        status_code = 200
+        text = "<html>challenge</html>"
+    with mock.patch.object(addon, "_get", return_value=R()):
+        assert addon.list_page("https://x/year/2026.html") is None
+    assert not addon.C_LIST.get("https://x/year/2026.html")[0], "nothing cached"
+
+    class Big:
+        status_code = 200
+        text = "<html>" + ("padding " * 2000) + "</html>"      # >12 KB, 0 cards
+    with mock.patch.object(addon, "_get", return_value=Big()):
+        assert addon.list_page("https://x/empty-shelf") == []
+    assert addon.C_LIST.get("https://x/empty-shelf")[0] is True, "honest empty is cached"
+
+
+def test_list_page_non_200_is_transient():
+    clear_caches()
+    addon._LIST_STALE.clear()
+
+    class R:
+        status_code = 502
+        text = "x" * 40000
+    with mock.patch.object(addon, "_get", return_value=R()):
+        assert addon.list_page("https://x/y") is None
+    assert not addon.C_LIST.get("https://x/y")[0]
+
+
+def test_debug_url_route_reports_the_real_path():
+    with mock.patch.object(addon, "_fetch",
+                           return_value=(_resp(200, _listing(2)), True)):
+        d = _json_body(_http_get("/debug/url?k=%s&u=https://banglaplex.biz/year/2026.html"
+                                 % addon.DEBUG_KEY))
+    assert d["status"] == 200 and d["via_proxy"] is True and d["cards"] == 2
+    assert d["looks_blocked"] is False
+    assert _json_body(_http_get("/debug/url?k=%s" % addon.DEBUG_KEY))["error"]
+
+
 def test_list_page_transient_failure_caches_nothing():
     clear_caches()
     addon._LIST_STALE.clear()

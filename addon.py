@@ -50,7 +50,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.2.0"
+VERSION    = "1.2.1"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -711,6 +711,28 @@ def _pool_stats():
             "enabled": POOL_ON}
 
 
+_CF_MARKERS = ("cf-browser-verification", "cf-chl-", "challenge-platform",
+               "just a moment", "checking your browser", "cf-turnstile",
+               "attention required", "ray id", "cloudflare")
+
+
+def _looks_blocked(text, status=200):
+    """True for a 403/503 AND for a 200 whose body is really a Cloudflare
+    interstitial.
+
+    Some free exits are themselves flagged, and they answer 200 with a challenge
+    page. Measured on prod: a shelf came back "0 items" and got cached as an
+    honest empty, because a 200 interstitial parses to zero cards. Requiring two
+    markers inside a small body keeps real payloads (hex API blobs, tiny JSON)
+    out of the net."""
+    if status in (403, 503):
+        return True
+    if not text or len(text) > 20000:
+        return False
+    head = text[:3000].lower()
+    return sum(1 for m in _CF_MARKERS if m in head) >= 2
+
+
 def _fetch(url, timeout=12, referer=None, extra_headers=None, stream=False,
            allow_proxy=None):
     """(requests.Response | None, via_proxy). Direct first; on a 403/503/transport
@@ -731,9 +753,16 @@ def _fetch(url, timeout=12, referer=None, extra_headers=None, stream=False,
         except Exception:
             r = None
         if r is not None and r.status_code not in (403, 503):
-            if r.status_code in (429,):
-                _bench(host, 20)
-            return r, False
+            if not stream and _looks_blocked(r.text, r.status_code):
+                try:
+                    r.close()
+                except Exception:
+                    pass
+                r = None                       # this egress is flagged too
+            else:
+                if r.status_code in (429,):
+                    _bench(host, 20)
+                return r, False
         if stream and r is not None:
             try:
                 r.close()
@@ -770,7 +799,8 @@ def _pool_get(url, hd, timeout, stream=False):
             _pool_note(u, False)
             _STICKY_BUSY[u] = max(0, _STICKY_BUSY.get(u, 1) - 1)
             return None
-        if r.status_code in (403, 503):
+        if r.status_code in (403, 503) or (
+                not stream and _looks_blocked(getattr(r, "text", ""), r.status_code)):
             try:
                 r.close()
             except Exception:
@@ -2163,6 +2193,7 @@ def parse_listing(h):
 _LIST_STALE = {}          # url -> (usable_until, items)
 _LIST_REFRESH = set()
 _LIST_STALE_TTL = 12 * 3600
+_EMPTY_PAGE_MIN = 12000       # below this a 0-card page is a broken fetch, not empty
 
 
 def _list_revalidate(url, timeout):
@@ -2198,13 +2229,19 @@ def list_page(url, timeout=18):
     r = _get(url, timeout=timeout, referer=SITE + "/")
     if r is None:
         return None                                    # transient: cache nothing
-    items = parse_listing(r.text or "")
+    h = r.text or ""
+    items = parse_listing(h)
     if items:
         C_LIST.put(url, items, _LIST_TTL)
         _LIST_STALE[url] = (time.time() + _LIST_STALE_TTL, items)
-    else:
-        C_LIST.put(url, [], _NEG_TTL)                  # honest empty page
-    return items
+        return items
+    if r.status_code != 200 or len(h) < _EMPTY_PAGE_MIN:
+        # a genuinely empty shelf (e.g. /type/web-series.html) is still a ~40 KB
+        # page; anything smaller is a truncated or challenged body, and caching
+        # THAT as "no such titles" would blank a whole shelf for 5 minutes
+        return None
+    C_LIST.put(url, [], _NEG_TTL)                      # honest empty page
+    return []
 
 
 def catalog_prewarm():
@@ -3146,6 +3183,24 @@ class Handler(BaseHTTPRequestHandler):
             tr["subs"] = len(cards[0].get("subtitles", [])) if cards else 0
             tr["ms"] = int((time.time() - t0) * 1000)
             return self._send(200, tr)
+        if path == "/debug/url":
+            u = (q.get("u") or q.get("url") or [""])[0]
+            if not u.startswith("http"):
+                return self._send(200, {"error": "pass ?u=https://…"})
+            t1 = time.time()
+            r, via = _fetch(u, timeout=20, referer=SITE + "/")
+            body = "" if r is None else (r.text or "")
+            out = {"url": u, "via_proxy": bool(via), "ms": int((time.time() - t1) * 1000),
+                   "status": None if r is None else r.status_code,
+                   "bytes": len(body), "cards": len(parse_listing(body)),
+                   "looks_blocked": _looks_blocked(body, 0 if r is None else r.status_code),
+                   "head": body[:160].replace("\n", " ")}
+            if r is not None:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            return self._send(200, out)
         if path == "/debug/net":
             only = (q.get("probe") or [""])[0] or None
             return self._send(200, _net_probe(only))
