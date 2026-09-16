@@ -37,7 +37,8 @@ def _quiesce(timeout=8.0):
     test_build_meta_ships_a_year_*, test_http_gzip). ThreadPoolExecutor is FIFO, so
     a sentinel submitted now is guaranteed to run after everything queued so far."""
     import concurrent.futures as cf
-    for ex in (addon._IO_EX, addon._V_EX, addon._BUILD_EX, addon._PP_EX, addon._P_EX):
+    for ex in (addon._IO_EX, addon._V_EX, addon._BUILD_EX, addon._PP_EX,
+               addon._P_EX, addon._ABYSS_PROBE_EX):
         try:
             cf.wait([ex.submit(lambda: None)], timeout=timeout)
         except Exception:
@@ -64,7 +65,7 @@ def clear_caches():
     for c in (addon.C_SEARCH, addon.C_PAGE, addon.C_META, addon.C_EMBED,
               addon.C_N1, addon.C_STREAM, addon.C_LIST, addon.C_IMDB,
               addon.C_METARES, addon.C_SLUG, addon.C_ABYSS,
-              addon.C_ABYSS_ONLY):
+              addon.C_ABYSS_PROBE, addon.C_ABYSS_ONLY):
         c.clear()
         c.bytes = 0
     addon.C_STALE.clear()
@@ -75,6 +76,8 @@ def clear_caches():
         addon._BUILD_INFLIGHT.clear()
     addon._SLUG_KIND.clear()
     addon._N1_RESOLVE_STATE.clear()
+    with addon._ABYSS_PROBE_LOCK:
+        addon._ABYSS_PROBE_INFLIGHT.clear()
     addon._PREWARM_BUSY[0] = False      # a killed prewarm must not leak "busy"
     # NOTE: never _STATS.clear() — it is a counter dict whose keys the /health
     # surface and the tests read directly; emptying it raises KeyError.
@@ -3158,6 +3161,43 @@ def test_resolve_file_routes_a_bare_abyss_iframe():
                                     time.time() + 20)
     assert cards == [{"_cdn": "abyss"}]
     assert ra.call_args[0][0] == "https://abyssplayer.com/UpjbDHK5N"
+
+
+
+def test_abyss_probe_cache_is_positive_only_and_singleflight_safe():
+    clear_caches()
+    with mock.patch.object(addon, "_abyss_probe", return_value=(206, True)) as probe:
+        assert addon._abyss_probe_cached("https://x/sora/1/t", True) == (206, True)
+        assert addon._abyss_probe_cached("https://x/sora/1/t", True) == (206, True)
+    assert probe.call_count == 1, "a verified URL should be reused during its short TTL"
+    assert addon._STATS.get("abyss_probe_hits", 0) >= 1
+
+    clear_caches()
+    with mock.patch.object(addon, "_abyss_probe", return_value=(400, False)) as bad:
+        assert addon._abyss_probe_cached("https://x/sora/1/bad", True) == (400, False)
+        assert addon._abyss_probe_cached("https://x/sora/1/bad", True) == (400, False)
+    assert bad.call_count == 2, "transient/negative origin results must not be cached"
+
+
+
+def test_abyss_probe_coalesces_concurrent_same_url_requests():
+    clear_caches()
+    import concurrent.futures as cf
+    gate = threading.Event()
+
+    def slow_probe(_url, _range=True):
+        gate.wait(2)
+        return (206, True)
+
+    with mock.patch.object(addon, "_abyss_probe", side_effect=slow_probe) as probe:
+        with cf.ThreadPoolExecutor(max_workers=8) as ex:
+            futures = [ex.submit(addon._abyss_probe_cached,
+                                 "https://x/sora/1/shared", True) for _ in range(8)]
+            time.sleep(0.05)
+            gate.set()
+            assert [f.result(timeout=5) for f in futures] == [(206, True)] * 8
+    assert probe.call_count == 1
+    assert addon._STATS.get("abyss_probe_coalesced", 0) >= 1
 
 
 def test_abyss_probe_reads_only_the_header_of_a_200():

@@ -6,7 +6,7 @@ BanglaPlex — Stremio addon (stream-only, strict zero-bandwidth)
 Site      : https://banglaplex.biz            (OVOO Movie/TV CMS, CodeIgniter, Cloudflare)
 Player    : plextream.work/embed.php?id={eid} -> server buttons
             -> bpx.strp2p.site/#{vid} | bpx.rpmvid.site/#{vid}   ("3n1" frontend family)
-            -> abyssplayer.com/{code}                            (SoTrym, NOT supported yet)
+            -> abyssplayer.com/{code}                            (SoTrym, direct MP4 + browser fallback)
 Media API : GET https://{n1host}/api/v1/video?id={vid}
             -> body = hex(AES-128-CBC(json))   key=kiemtienmua911ca iv=1234567890oiuytr
             -> {hlsVideoTiktok, cfNative, cf, source, subtitle{}, title, streamingConfig, ...}
@@ -51,7 +51,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
 import requests
 
 # ═══════════════════════════════════════════════════════════════════ 1. CONFIG
-VERSION    = "1.7.3"
+VERSION    = "1.7.4"
 BRAND      = "BanglaPlex"
 ADDON_NAME = "BanglaPlex"
 SITE       = os.environ.get("BPX_SITE", "https://banglaplex.biz").rstrip("/")
@@ -90,6 +90,7 @@ _PAGE_TTL     = 6 * 3600
 _META_TTL     = 12 * 3600
 _EMBED_TTL    = 6 * 3600
 _ABYSS_TTL    = 6 * 3600          # decrypted media map: tokens carry no expiry
+_ABYSS_PROBE_TTL = max(60.0, min(3600.0, float(os.environ.get("BPX_ABYSS_PROBE_TTL", "900"))))
 _N1_TTL       = 30 * 60        # video payload (tiktok urls live ~1y, cf k/kx ~24h)
 _STREAM_TTL   = 40 * 60
 _STREAM_STALE = 100 * 60       # SWR ceiling (cf token ~24h, tiktok ~1y)
@@ -194,6 +195,7 @@ C_IMDB    = TTLCache(2 * 1024 * 1024, "imdbmap")
 C_METARES = TTLCache(6 * 1024 * 1024, "metares")
 C_SLUG    = TTLCache(1 * 1024 * 1024, "slugmap")
 C_ABYSS   = TTLCache(4 * 1024 * 1024, "abyss")
+C_ABYSS_PROBE = TTLCache(2 * 1024 * 1024, "abyss-probe")  # positive ftyp probes only
 C_ABYSS_ONLY = TTLCache(1 * 1024 * 1024, "abyss-only")  # confirmed dead 3n1 route
 C_STALE   = {}                                    # key -> (expiry, cards)
 _NEG_RETRY_AT = {}
@@ -207,6 +209,12 @@ _IO_EX   = ThreadPoolExecutor(max_workers=24, thread_name_prefix="io")
 _V_EX    = ThreadPoolExecutor(max_workers=24, thread_name_prefix="verify")
 _P_EX    = ThreadPoolExecutor(max_workers=24, thread_name_prefix="proxy")
 _PP_EX   = ThreadPoolExecutor(max_workers=24, thread_name_prefix="poolprobe")
+# Abyss probes are tiny direct header reads, but many different episodes can point
+# to the same Sora URL. Keep their shared waits out of _V_EX so three outer resolve
+# tasks cannot deadlock while each waits for a probe submitted to the same executor.
+_ABYSS_PROBE_EX = ThreadPoolExecutor(max_workers=12, thread_name_prefix="abyssprobe")
+_ABYSS_PROBE_INFLIGHT = {}
+_ABYSS_PROBE_LOCK = threading.Lock()
 # 2 builds meant a third concurrent tap could only wait; a build that outlives the
 # wall still pays off now (see _adopt_late_result), but waiting is not resolving.
 _BUILD_EX = ThreadPoolExecutor(max_workers=8, thread_name_prefix="build")
@@ -231,7 +239,8 @@ _REQLOG = []
 _REQLOG_LOCK = threading.Lock()
 _STATS = {"started": time.time(), "resolves": 0, "cards": 0, "empties": 0,
           "n1_calls": 0, "n1_429": 0, "relay_bytes": 0, "slug_hits": 0,
-          "build_coalesced": 0, "abyss_only_hits": 0}
+          "build_coalesced": 0, "abyss_only_hits": 0,
+          "abyss_probe_hits": 0, "abyss_probe_coalesced": 0}
 
 
 def _log(entry):
@@ -1858,6 +1867,41 @@ def _abyss_probe(url, use_range=True):
         return None, False
 
 
+def _abyss_probe_cached(url, use_range=True):
+    """Return a previously verified `(status, ftyp_ok)` for this Sora URL.
+
+    Only a positive header probe is retained. A 400/403/timeout is deliberately
+    not cached: an origin hiccup must be retried for the next user. The inflight
+    Future closes the small race where several episode builds discover the same
+    source at once, without putting nested work on `_V_EX`.
+    """
+    key = (url, bool(use_range))
+    hit, value = C_ABYSS_PROBE.get(key)
+    if hit:
+        _STATS["abyss_probe_hits"] = _STATS.get("abyss_probe_hits", 0) + 1
+        return value
+    with _ABYSS_PROBE_LOCK:
+        fut = _ABYSS_PROBE_INFLIGHT.get(key)
+        if fut is None:
+            fut = _ABYSS_PROBE_EX.submit(_abyss_probe, url, bool(use_range))
+            _ABYSS_PROBE_INFLIGHT[key] = fut
+        else:
+            _STATS["abyss_probe_coalesced"] = _STATS.get("abyss_probe_coalesced", 0) + 1
+    try:
+        value = fut.result(timeout=18)
+    except Exception:
+        value = (None, False)
+    finally:
+        with _ABYSS_PROBE_LOCK:
+            if _ABYSS_PROBE_INFLIGHT.get(key) is fut:
+                _ABYSS_PROBE_INFLIGHT.pop(key, None)
+    if value and value[1]:
+        # Positive-only cache: this is evidence the URL was playable, not a
+        # negative answer. The next request will re-probe after this short TTL.
+        C_ABYSS_PROBE.put(key, value, _ABYSS_PROBE_TTL)
+    return value
+
+
 def _human_bytes(n):
     try:
         n = float(n or 0)
@@ -1899,7 +1943,7 @@ def resolve_abyss(abyss_url, page=None, note="", ctype="movie", se=None, ep=None
     for src in srcs[:ABYSS_MAX_CARDS]:
         url, seekable = abyss_stream_url(src, blob.get("md5_id"))
         picks.append((src, url, seekable,
-                      _V_EX.submit(_abyss_probe, url, seekable)))
+                      _V_EX.submit(_abyss_probe_cached, url, seekable)))
     cards = []
     budget = max(0.5, (deadline or (time.time() + 20)) - time.time())
     for src, url, seekable, f in picks:
@@ -3955,8 +3999,12 @@ class Handler(BaseHTTPRequestHandler):
                 "configurable": True,
                 "caches": [c.stats() for c in
                            (C_SEARCH, C_PAGE, C_META, C_EMBED, C_N1, C_STREAM,
-                            C_LIST, C_IMDB, C_METARES)],
+                            C_LIST, C_IMDB, C_METARES, C_ABYSS,
+                            C_ABYSS_PROBE, C_ABYSS_ONLY)],
                 "stale": len(C_STALE), "reqlog_len": len(_REQLOG),
+                "abyss": {"probe_ttl_s": _ABYSS_PROBE_TTL,
+                          "probe_inflight": len(_ABYSS_PROBE_INFLIGHT),
+                          "probe_cache": C_ABYSS_PROBE.stats()},
                 "egress": "text-only (json), zero media bytes",
             })
         if path in ("/", "/install", "/index.html"):
